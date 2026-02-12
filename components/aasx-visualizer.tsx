@@ -5,7 +5,7 @@ import type React from "react"
 import { useState, useEffect } from "react"
 import { ChevronRight, ChevronDown, FileText, CheckCircle, AlertCircle, Download, X, Copy } from 'lucide-react'
 import JSZip from 'jszip'
-import type { ValidationResult } from "@/lib/types" // Import ValidationResult type
+import type { ValidationResult, ValidationError } from "@/lib/types" // Import ValidationResult type
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible" // Import Collapsible components
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -914,12 +914,13 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
     const type = getElementType(selectedElement)
     const isCollection = type === "SubmodelElementCollection" || type === "SubmodelElementList"
 
+    // Type color mapping for header backgrounds
     const typeColorMap: Record<string, string> = {
       SubmodelElementCollection: "#61caf3",
       Property: "#6662b4",
       MultiLanguageProperty: "#ffa500",
       File: "#10b981",
-      SubmodelElementList: "#10b981",
+      SubmodelElementList: "#22c55e",
       BasicEventElement: "#9e005d",
       Blob: "#8b5cf6",
       Operation: "#f59e0b",
@@ -931,6 +932,48 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
       AnnotatedRelationshipElement: "#0891b2",
     }
     const typeColor = typeColorMap[type] || "#1793b8"
+
+    // Badge color classes for different element types
+    const getBadgeColorClass = (t: string): string => {
+      const colorClasses: Record<string, string> = {
+        SubmodelElementCollection: "bg-[#61caf3] text-white",
+        SubmodelElementList: "bg-emerald-500 text-white",
+        Property: "bg-[#6662b4] text-white",
+        MultiLanguageProperty: "bg-orange-500 text-white",
+        File: "bg-emerald-500 text-white",
+        BasicEventElement: "bg-pink-700 text-white",
+        Blob: "bg-violet-500 text-white",
+        Operation: "bg-amber-500 text-white",
+        Range: "bg-pink-500 text-white",
+        ReferenceElement: "bg-teal-500 text-white",
+        Entity: "bg-orange-500 text-white",
+        Capability: "bg-purple-500 text-white",
+        RelationshipElement: "bg-cyan-500 text-white",
+        AnnotatedRelationshipElement: "bg-cyan-600 text-white",
+      }
+      return colorClasses[t] || "bg-gray-500 text-white"
+    }
+
+    // Badge labels
+    const getBadgeLabel = (t: string): string => {
+      const labels: Record<string, string> = {
+        SubmodelElementCollection: "SMC",
+        SubmodelElementList: "SML",
+        Property: "Prop",
+        MultiLanguageProperty: "MLP",
+        File: "File",
+        BasicEventElement: "Event",
+        Blob: "Blob",
+        Operation: "Op",
+        Range: "Range",
+        ReferenceElement: "Ref",
+        Entity: "Entity",
+        Capability: "Cap",
+        RelationshipElement: "Rel",
+        AnnotatedRelationshipElement: "AnnRel",
+      }
+      return labels[t] || "Node"
+    }
 
     const hexToRgba = (hex: string, opacity: number) => {
       const r = Number.parseInt(hex.slice(1, 3), 16)
@@ -1080,38 +1123,62 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
     const isRequired = cardinalityValue === "One" || cardinalityValue === "OneToMany"
 
     return (
-      <div className="p-4 space-y-6">
-        {/* Editor-like header: badges + title + edit toggle */}
-        <div className="space-y-3 pb-4 border-b">
-          <div className="flex items-center gap-2">
-            {getTypeBadge(type)}
-            {getCardinalityBadge(cardinalityValue)}
-            {/* Edit button moved to top header */}
-          </div>
-          <h3 className="font-semibold text-lg">{selectedElement.idShort || "Element"}</h3>
-          {/* NEW: Editable idShort for all elements */}
-          {editMode && (
-            <div className="grid gap-1">
-              <label className="text-xs text-gray-600 dark:text-gray-400">IdShort</label>
-              <Input
-                value={selectedElement.idShort || ""}
-                onChange={(e) => setField("idShort", e.target.value)}
-                className="font-mono text-xs"
-                placeholder="Enter idShort..."
-              />
-              {/* inline hint when invalid */}
-              {(() => {
-                const s = String(selectedElement.idShort || "").trim()
-                const ok = /^[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z]$/.test(s)
-                return !ok ? (
-                  <div className="text-[11px] text-red-600">
-                    Use letters, digits, "_" or "-"; start with a letter and end with a letter or digit.
-                  </div>
-                ) : null
-              })()}
+      <div className="h-full flex flex-col overflow-hidden">
+        {/* Colored header based on element type */}
+        <div
+          className="px-4 py-3 shrink-0"
+          style={{ backgroundColor: hexToRgba(typeColor, 0.15) }}
+        >
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <span className={`px-2.5 py-1 rounded-md text-xs font-bold ${getBadgeColorClass(type)}`}>
+                {getBadgeLabel(type)}
+              </span>
+              {cardinalityValue !== "N/A" && getCardinalityBadge(cardinalityValue)}
             </div>
-          )}
+          </div>
+          <h3
+            className="font-semibold text-lg"
+            style={{ color: typeColor }}
+          >
+            {selectedElement.idShort || "Element"}
+          </h3>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{type}</p>
         </div>
+
+        {/* Scrollable content */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+          {/* IdShort field (editable when in edit mode) */}
+          <div className="space-y-2">
+            <label className="text-xs font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wide">
+              IdShort
+            </label>
+            {editMode ? (
+              <div className="space-y-1">
+                <Input
+                  value={selectedElement.idShort || ""}
+                  onChange={(e) => setField("idShort", e.target.value)}
+                  className="font-mono text-sm"
+                  placeholder="Enter idShort..."
+                />
+                {(() => {
+                  const s = String(selectedElement.idShort || "").trim()
+                  const ok = /^[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]$|^[a-zA-Z]$/.test(s)
+                  return !ok ? (
+                    <div className="text-[11px] text-red-600">
+                      Use letters, digits, "_" or "-"; start with a letter and end with a letter or digit.
+                    </div>
+                  ) : null
+                })()}
+              </div>
+            ) : (
+              <div className="px-3 py-2 bg-gray-50 dark:bg-gray-800 rounded-md border border-gray-200 dark:border-gray-700">
+                <span className="font-mono text-sm text-gray-900 dark:text-gray-100">
+                  {selectedElement.idShort || "—"}
+                </span>
+              </div>
+            )}
+          </div>
 
         {/* VALUE section (green) */}
         <div className="space-y-3 bg-green-50 dark:bg-green-900/20 rounded-lg p-3">
@@ -1412,6 +1479,7 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
               />
             </div>
           ))}
+        </div>
       </div>
     )
   }

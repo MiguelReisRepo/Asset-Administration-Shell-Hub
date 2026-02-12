@@ -44,7 +44,6 @@ async function extractThumbnail(zipContent: JSZip): Promise<string | null> {
     for (const path of thumbnailPaths) {
       const file = zipContent.files[path]
       if (file && !file.dir) {
-        console.log(`[v0] Found thumbnail at: ${path}`)
         const imageData = await file.async("base64")
         const extension = path.toLowerCase().split(".").pop()
         const mimeType = extension === "png" ? "image/png" : "image/jpeg"
@@ -59,7 +58,6 @@ async function extractThumbnail(zipContent: JSZip): Promise<string | null> {
 
     if (imageFiles.length > 0) {
       const imagePath = imageFiles[0]
-      console.log(`[v0] Found fallback image at: ${imagePath}`)
       const imageData = await zipContent.files[imagePath].async("base64")
       const extension = imagePath.toLowerCase().split(".").pop()
       const mimeType = extension === "png" ? "image/png" : "image/jpeg"
@@ -68,7 +66,6 @@ async function extractThumbnail(zipContent: JSZip): Promise<string | null> {
 
     return null
   } catch (error) {
-    console.error("[v0] Error extracting thumbnail:", error)
     return null
   }
 }
@@ -77,13 +74,17 @@ async function extractThumbnail(zipContent: JSZip): Promise<string | null> {
 export async function processFile(file: File, onProgress: (progress: number) => void): Promise<ValidationResult[]> {
   const results: ValidationResult[] = []
 
-  console.log(`[v0] Starting validation for: ${file.name}`)
   onProgress(10)
 
   try {
     if (file.name.toLowerCase().endsWith(".aasx")) {
       const zip = new JSZip()
-      const zipContent = await zip.loadAsync(file)
+      // Store the original AASX bytes as base64 for later re-download
+      const fileArrayBuffer = await file.arrayBuffer()
+      const originalAasxBase64 = btoa(
+        new Uint8Array(fileArrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
+      )
+      const zipContent = await zip.loadAsync(fileArrayBuffer)
       onProgress(30)
       const startedAt = Date.now()
 
@@ -106,14 +107,18 @@ export async function processFile(file: File, onProgress: (progress: number) => 
       const xmlFiles = [...allXmlFiles].sort((a, b) => score(b) - score(a))
 
       // Find JSON files in the AASX (look for model.json or similar AAS JSON files)
-      const jsonFiles = Object.keys(zipContent.files).filter(
-        (name) =>
-          name.toLowerCase().endsWith(".json") &&
-          !zipContent.files[name].dir &&
-          (name.includes("model.json") || name.includes("aas") || name.includes("environment")),
-      )
+      // Use filename only (not path) to avoid matching aasx/random.json due to "aas" in folder name
+      const jsonFiles = Object.keys(zipContent.files).filter((name) => {
+        if (!name.toLowerCase().endsWith(".json") || zipContent.files[name].dir) return false
+        const filename = name.split("/").pop()?.toLowerCase() || ""
+        return (
+          filename === "model.json" ||
+          filename.includes("aasenv") ||
+          filename.includes("aas.json") ||
+          filename.includes("environment")
+        )
+      })
 
-      console.log(`[v0] Found ${xmlFiles.length} XML files and ${jsonFiles.length} JSON files`)
       onProgress(50)
 
       let overallValid = true
@@ -124,6 +129,8 @@ export async function processFile(file: File, onProgress: (progress: number) => 
       const attachments: Record<string, string> = {}
       // ADDED: keep the raw XML we chose for validation to pass to the editor later
       let selectedXmlContent: string | null = null
+      // ADDED: track which XML file path was selected within the AASX
+      let selectedXmlPath: string | null = null
 
       // Try XML candidates until one parses (valid or invalid) so we at least extract data/errors
       if (xmlFiles.length > 0) {
@@ -132,8 +139,9 @@ export async function processFile(file: File, onProgress: (progress: number) => 
           try {
             const xmlContent = await zipContent.files[candidate].async("text")
             triedAny = true
-            // ADDED: remember chosen XML content
+            // ADDED: remember chosen XML content and path
             selectedXmlContent = xmlContent
+            selectedXmlPath = candidate
             const xmlResult = await validateXML(xmlContent, candidate)
             overallValid = overallValid && xmlResult.valid
             if (!xmlResult.valid) {
@@ -141,11 +149,9 @@ export async function processFile(file: File, onProgress: (progress: number) => 
             }
             if (xmlResult.aasData && !aasData) aasData = xmlResult.aasData
             if (xmlResult.parsed && !parsedContent) parsedContent = xmlResult.parsed
-            console.log(`[v0] XML validation result for ${candidate}: ${xmlResult.valid}`)
             // Stop after first candidate we tried (we already captured pass/fail)
             break
           } catch (error) {
-            console.warn(`[v0] XML candidate failed to load/parse ${candidate}:`, error)
             continue
           }
         }
@@ -174,14 +180,11 @@ export async function processFile(file: File, onProgress: (progress: number) => 
           // Prefer JSON aasData to preserve element order and metadata from the editor
           if (jsonResult.aasData) aasData = jsonResult.aasData
           if (jsonResult.parsed) parsedContent = jsonResult.parsed
-
-          console.log(`[v0] JSON validation result for ${mainJsonFile}: ${jsonResult.valid}`)
         } catch (error) {
           overallValid = false
           allErrors.push(
             `Failed to validate JSON file ${mainJsonFile}: ${error instanceof Error ? error.message : "Unknown error"}`,
           )
-          console.error(`[v0] JSON validation error for ${mainJsonFile}:`, error)
         }
       } else {
         // CHANGED: JSON is optional — don't flip overallValid to false, just add a warning
@@ -216,14 +219,11 @@ export async function processFile(file: File, onProgress: (progress: number) => 
         attachments: Object.keys(attachments).length ? attachments : undefined,
         // ADDED: original XML content selected from AASX (if found)
         originalXml: selectedXmlContent || undefined,
+        // ADDED: store original AASX for re-download with fixed XML
+        originalAasxBase64: originalAasxBase64,
+        aasxXmlPath: selectedXmlPath || undefined,
       }
       results.push(aasxResult)
-
-      if (!aasxResult.valid && aasxResult.errors) {
-        console.groupCollapsed(`[v0] AASX Validation Errors for ${file.name}`)
-        console.table(aasxResult.errors)
-        console.groupEnd()
-      }
 
     } else if (file.name.toLowerCase().endsWith(".xml")) {
       const xmlContent = await file.text()
@@ -231,25 +231,12 @@ export async function processFile(file: File, onProgress: (progress: number) => 
       // ADDED: attach the raw XML so the editor can validate the exact bytes
       results.push({ ...xmlResult, originalXml: xmlContent })
 
-      if (!xmlResult.valid && xmlResult.errors) {
-        console.groupCollapsed(`[v0] XML Validation Errors for ${file.name}`)
-        console.table(xmlResult.errors)
-        console.groupEnd()
-      }
-
     } else if (file.name.toLowerCase().endsWith(".json")) {
       const jsonContent = await file.text()
       const jsonResult = await validateJSON(jsonContent, file.name)
       results.push(jsonResult)
-
-      if (!jsonResult.valid && jsonResult.errors) {
-        console.groupCollapsed(`[v0] JSON Validation Errors for ${file.name}`)
-        console.table(jsonResult.errors)
-        console.groupEnd()
-      }
     }
   } catch (error) {
-    console.error(`[v0] File processing error:`, error)
     const errorResult: ValidationResult = {
       file: file.name,
       type: "AASX", // Default to AASX type for general file processing errors
@@ -258,13 +245,9 @@ export async function processFile(file: File, onProgress: (progress: number) => 
       processingTime: 0,
     }
     results.push(errorResult)
-    console.groupCollapsed(`[v0] General File Processing Error for ${file.name}`)
-    console.table(errorResult.errors)
-    console.groupEnd()
   }
 
   onProgress(100)
-  console.log(`[v0] Validation completed for ${file.name}. Results:`, results)
   return results
 }
 
@@ -272,7 +255,6 @@ async function validateXML(xmlContent: string, fileName: string): Promise<Valida
   const startTime = Date.now()
 
   try {
-    console.log(`[v0] Starting comprehensive XML validation for: ${fileName}`)
     const result = await validateAASXXml(xmlContent)
 
     return {
@@ -285,7 +267,6 @@ async function validateXML(xmlContent: string, fileName: string): Promise<Valida
       aasData: result.aasData,
     }
   } catch (error) {
-    console.error(`[v0] XML validation error:`, error)
     return {
       file: fileName,
       type: "XML",
@@ -300,7 +281,6 @@ async function validateJSON(jsonContent: string, fileName: string): Promise<Vali
   const startTime = Date.now()
 
   try {
-    console.log(`[v0] Starting comprehensive JSON validation for: ${fileName}`)
     // Use the comprehensive JSON validation
     const result = await validateAASXJson(jsonContent) // Use validateAASXJson which includes parsing and structure validation
 
@@ -314,7 +294,6 @@ async function validateJSON(jsonContent: string, fileName: string): Promise<Vali
       aasData: result.aasData,
     }
   } catch (error) {
-    console.error(`[v0] JSON validation error:`, error)
     return {
       file: fileName,
       type: "JSON",
@@ -324,3 +303,4 @@ async function validateJSON(jsonContent: string, fileName: string): Promise<Vali
     }
   }
 }
+

@@ -19,6 +19,16 @@ export interface ValidationResult {
   attachments?: Record<string, string>
   // ADDED: raw uploaded XML to allow the editor to validate the exact bytes
   originalXml?: string
+  // ADDED: original AASX file as base64 for re-download with fixed XML
+  originalAasxBase64?: string
+  // ADDED: path to the XML file within the AASX
+  aasxXmlPath?: string
+  // ADDED: record of fixes applied during validation fix process
+  appliedFixes?: Array<{
+    element: string
+    issue: string
+    fix: string
+  }>
 }
 
 // Interfaces for parsed AAS data (simplified for display)

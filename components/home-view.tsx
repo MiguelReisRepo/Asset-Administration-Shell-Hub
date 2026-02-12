@@ -1,9 +1,9 @@
 "use client";
 
 import React from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { FileText, ArrowRight, AlertCircle, CheckCircle, Upload, Plus, X } from "lucide-react";
+import { FileText, ArrowRight, AlertCircle, CheckCircle, Upload, Plus, X, Wrench, Loader2, Download, Sparkles, Package, FolderOpen, CheckSquare, Square, Trash2, FileSpreadsheet } from "lucide-react";
 import { Search, Filter } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import {
@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
 import type { ValidationResult } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface HomeViewProps {
   files: ValidationResult[];
@@ -24,14 +25,97 @@ interface HomeViewProps {
   onCreateClick: () => void;
   onReorder: (fromIndex: number, toIndex: number) => void;
   onDelete: (index: number) => void;
+  onFix?: (index: number) => void;
+  fixingIndex?: number | null;
+  onDownload?: (index: number) => void;
+  onGenerateReport?: (index: number) => void;
 }
 
-export default function HomeView({ files, onOpen, onUploadClick, onCreateClick, onReorder, onDelete }: HomeViewProps) {
+export default function HomeView({ files, onOpen, onUploadClick, onCreateClick, onReorder, onDelete, onFix, fixingIndex, onDownload, onGenerateReport }: HomeViewProps) {
   const [dragIndex, setDragIndex] = React.useState<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = React.useState<number | null>(null);
   const [searchQuery, setSearchQuery] = React.useState<string>("");
   const [selectedSubmodels, setSelectedSubmodels] = React.useState<Set<string>>(new Set());
   const [validityFilter, setValidityFilter] = React.useState<"all" | "valid" | "invalid">("all");
+
+  // Batch selection state
+  const [selectedFiles, setSelectedFiles] = React.useState<Set<number>>(new Set());
+  const [batchFixingCount, setBatchFixingCount] = React.useState(0);
+
+  // Toggle file selection
+  const toggleFileSelection = (index: number, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setSelectedFiles((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+  };
+
+  // Select/deselect all visible files
+  const toggleSelectAll = () => {
+    const visibleIndices = filteredFiles.map((_, i) => files.indexOf(filteredFiles[i]));
+    const allSelected = visibleIndices.every((i) => selectedFiles.has(i));
+    if (allSelected) {
+      setSelectedFiles(new Set());
+    } else {
+      setSelectedFiles(new Set(visibleIndices));
+    }
+  };
+
+  // Batch delete
+  const handleBatchDelete = () => {
+    const indices = Array.from(selectedFiles).sort((a, b) => b - a); // Delete from end to preserve indices
+    indices.forEach((i) => onDelete(i));
+    setSelectedFiles(new Set());
+  };
+
+  // Batch fix
+  const handleBatchFix = async () => {
+    if (!onFix) return;
+    const invalidIndices = Array.from(selectedFiles).filter((i) => files[i]?.valid === false);
+    setBatchFixingCount(invalidIndices.length);
+    for (const i of invalidIndices) {
+      await onFix(i);
+    }
+    setBatchFixingCount(0);
+    setSelectedFiles(new Set());
+  };
+
+  // Batch download
+  const handleBatchDownload = () => {
+    if (!onDownload) return;
+    const validIndices = Array.from(selectedFiles).filter((i) => files[i]?.valid === true);
+    validIndices.forEach((i) => onDownload(i));
+    setSelectedFiles(new Set());
+  };
+
+  // Batch report generation
+  const handleBatchReport = () => {
+    if (!onGenerateReport) return;
+    const validIndices = Array.from(selectedFiles).filter((i) => files[i]?.valid === true);
+    validIndices.forEach((i) => onGenerateReport(i));
+    setSelectedFiles(new Set());
+  };
+
+  // Get batch stats
+  const batchStats = React.useMemo(() => {
+    const selected = Array.from(selectedFiles);
+    return {
+      total: selected.length,
+      valid: selected.filter((i) => files[i]?.valid === true).length,
+      invalid: selected.filter((i) => files[i]?.valid === false).length,
+    };
+  }, [selectedFiles, files]);
+
+  // Clear selection when files change
+  React.useEffect(() => {
+    setSelectedFiles(new Set());
+  }, [files.length]);
 
   const getIdShort = (file: ValidationResult): string => {
     const idShort =
@@ -81,140 +165,365 @@ export default function HomeView({ files, onOpen, onUploadClick, onCreateClick, 
     });
   }, [files, searchQuery, selectedSubmodels, validityFilter]);
 
+  // Validation summary stats
+  const validationStats = React.useMemo(() => {
+    const total = files.length;
+    const valid = files.filter((f) => f.valid === true).length;
+    const invalid = files.filter((f) => f.valid === false).length;
+    const pending = files.filter((f) => f.valid === undefined).length;
+    const percentage = total > 0 ? Math.round((valid / total) * 100) : 0;
+    return { total, valid, invalid, pending, percentage };
+  }, [files]);
+
   return (
-    <div className="h-full overflow-auto">
-      <div className="px-6 py-6">
-        <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h2 className="text-2xl font-bold bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
-              Your AAS Models
-            </h2>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-              {files.length > 0
-                ? `Showing ${filteredFiles.length} of ${files.length} models`
-                : "No models loaded yet — upload or create an AAS to get started."}
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              onClick={onUploadClick}
-              className="bg-blue-600 text-white hover:bg-blue-700"
-            >
-              <Upload className="mr-2 h-4 w-4" />
-              Upload AAS
-            </Button>
-            <Button
-              onClick={onCreateClick}
-              className="bg-green-600 text-white hover:bg-green-700"
-            >
-              <Plus className="mr-2 h-4 w-4" />
-              Create AAS
-            </Button>
+    <div className="h-full overflow-auto bg-gradient-to-br from-slate-50 via-cyan-50/30 to-sky-50/50 dark:from-gray-900 dark:via-gray-900 dark:to-gray-800">
+      <div className="px-6 py-8">
+        {/* Hero Section */}
+        <div className="mb-8">
+          <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-[#61caf3] via-[#4db6e6] to-[#3a9fd4] p-8 shadow-xl shadow-cyan-500/20">
+            {/* Decorative elements */}
+            <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full -translate-y-32 translate-x-32 blur-3xl" />
+            <div className="absolute bottom-0 left-0 w-48 h-48 bg-white/10 rounded-full translate-y-24 -translate-x-24 blur-2xl" />
+
+            <div className="relative z-10">
+              <div className="flex items-center gap-3 mb-3">
+                <div className="p-2 bg-white/20 backdrop-blur-sm rounded-xl">
+                  <Package className="w-6 h-6 text-white" />
+                </div>
+                <span className="text-white/80 text-sm font-medium tracking-wide uppercase">Asset Administration Shell</span>
+              </div>
+              <h1 className="text-3xl md:text-4xl font-bold text-white mb-2">
+                Your AAS Models
+              </h1>
+              <p className="text-white/80 text-lg max-w-2xl">
+                {files.length > 0
+                  ? `Managing ${files.length} model${files.length !== 1 ? 's' : ''} • ${filteredFiles.length} visible`
+                  : "Upload or create your first Asset Administration Shell to get started"}
+              </p>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="relative z-10 flex flex-wrap gap-3 mt-6">
+              <Button
+                onClick={onUploadClick}
+                className="bg-white/20 backdrop-blur-sm text-white border border-white/30 hover:bg-white/30 shadow-lg transition-all duration-200 gap-2"
+              >
+                <Upload className="w-4 h-4" />
+                Upload AAS
+              </Button>
+              <Button
+                onClick={onCreateClick}
+                className="bg-white text-[#61caf3] hover:bg-white/90 shadow-lg shadow-black/10 transition-all duration-200 gap-2"
+              >
+                <Sparkles className="w-4 h-4" />
+                Create New AAS
+              </Button>
+            </div>
           </div>
         </div>
 
-        {/* Filters */}
-        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3 w-full sm:w-auto">
-            <div className="relative w-full sm:w-80">
-              <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
-              <Input
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search by idShort or file name"
-                className="pl-8 bg-white dark:bg-gray-900"
-                aria-label="Search models"
-              />
+        {/* Filters Bar */}
+        {files.length > 0 && (
+          <>
+          <div className="mb-6">
+            <div className="bg-white/70 dark:bg-gray-800/70 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-700/50 p-4 shadow-sm">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-3 flex-1">
+                  <div className="relative flex-1 max-w-md">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                    <Input
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Search by name or file..."
+                      className="pl-10 bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 focus:ring-2 focus:ring-[#61caf3] focus:border-transparent"
+                      aria-label="Search models"
+                    />
+                  </div>
+                  {allSubmodelOptions.length > 0 && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="outline" className="flex items-center gap-2 bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800">
+                          <Filter className="h-4 w-4" />
+                          <span className="hidden sm:inline">Submodels</span>
+                          {selectedSubmodels.size > 0 && (
+                            <span className="ml-1 rounded-full bg-[#61caf3] text-white px-2 py-0.5 text-xs font-medium">
+                              {selectedSubmodels.size}
+                            </span>
+                          )}
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent className="w-72 max-w-[90vw]">
+                        <DropdownMenuLabel className="flex items-center justify-between">
+                          <span>Filter by submodel</span>
+                          <span className="text-xs font-normal text-gray-400">
+                            {allSubmodelOptions.length} available
+                          </span>
+                        </DropdownMenuLabel>
+                        <DropdownMenuSeparator />
+                        <div className="max-h-64 overflow-y-auto">
+                          {allSubmodelOptions.map((name) => (
+                            <DropdownMenuCheckboxItem
+                              key={name}
+                              checked={selectedSubmodels.has(name)}
+                              onCheckedChange={(checked) => {
+                                setSelectedSubmodels((prev) => {
+                                  const next = new Set(prev);
+                                  if (checked) next.add(name);
+                                  else next.delete(name);
+                                  return next;
+                                });
+                              }}
+                              className="pr-2"
+                              title={name}
+                            >
+                              <span className="truncate">{name}</span>
+                            </DropdownMenuCheckboxItem>
+                          ))}
+                        </div>
+                        {selectedSubmodels.size > 0 && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="w-full justify-center text-gray-500 hover:text-gray-900 dark:hover:text-gray-100 text-xs"
+                              onClick={() => setSelectedSubmodels(new Set())}
+                            >
+                              <X className="w-3 h-3 mr-1" />
+                              Clear {selectedSubmodels.size} filter{selectedSubmodels.size !== 1 ? 's' : ''}
+                            </Button>
+                          </>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                  <Select value={validityFilter} onValueChange={(v) => setValidityFilter(v as "all" | "valid" | "invalid")}>
+                    <SelectTrigger className="w-32 bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700">
+                      <SelectValue placeholder="Validity" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All</SelectItem>
+                      <SelectItem value="valid">Valid</SelectItem>
+                      <SelectItem value="invalid">Invalid</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
             </div>
-            {allSubmodelOptions.length > 0 && (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="outline" className="flex items-center gap-2 bg-white dark:bg-gray-900">
-                    <Filter className="h-4 w-4" />
-                    Submodels
-                    {selectedSubmodels.size > 0 && (
-                      <span className="ml-1 rounded bg-blue-600 text-white px-1.5 py-0.5 text-xs">
-                        {selectedSubmodels.size}
-                      </span>
+          </div>
+
+          {/* Validation Summary Card */}
+          <div className="mb-6">
+            <div className="bg-white/70 dark:bg-gray-800/70 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-700/50 p-4 shadow-sm">
+              <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                <div className="flex items-center gap-6 flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="p-2 bg-gray-100 dark:bg-gray-700 rounded-lg">
+                      <FileText className="w-4 h-4 text-gray-500 dark:text-gray-400" />
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-gray-800 dark:text-gray-200">{validationStats.total}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400">Total</div>
+                    </div>
+                  </div>
+                  <div className="h-8 w-px bg-gray-200 dark:bg-gray-700" />
+                  <div className="flex items-center gap-2">
+                    <div className="p-2 bg-emerald-100 dark:bg-emerald-900/30 rounded-lg">
+                      <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{validationStats.valid}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400">Valid</div>
+                    </div>
+                  </div>
+                  <div className="h-8 w-px bg-gray-200 dark:bg-gray-700" />
+                  <div className="flex items-center gap-2">
+                    <div className="p-2 bg-red-100 dark:bg-red-900/30 rounded-lg">
+                      <AlertCircle className="w-4 h-4 text-red-600 dark:text-red-400" />
+                    </div>
+                    <div>
+                      <div className="text-2xl font-bold text-red-600 dark:text-red-400">{validationStats.invalid}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400">Invalid</div>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex-1 max-w-xs">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs font-medium text-gray-600 dark:text-gray-400">Compliance Rate</span>
+                    <span className="text-sm font-bold text-[#61caf3]">{validationStats.percentage}%</span>
+                  </div>
+                  <div className="h-2.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-[#61caf3] to-[#4db6e6] rounded-full transition-all duration-500"
+                      style={{ width: `${validationStats.percentage}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Batch Action Bar */}
+          {selectedFiles.size > 0 && (
+            <div className="mt-3 flex items-center justify-between p-3 rounded-xl bg-gradient-to-r from-[#61caf3]/10 to-[#4db6e6]/10 border border-[#61caf3]/30">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={toggleSelectAll}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm font-medium hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                >
+                  {filteredFiles.every((_, i) => selectedFiles.has(files.indexOf(filteredFiles[i]))) ? (
+                    <>
+                      <CheckSquare className="w-4 h-4 text-[#61caf3]" />
+                      Deselect All
+                    </>
+                  ) : (
+                    <>
+                      <Square className="w-4 h-4" />
+                      Select All
+                    </>
+                  )}
+                </button>
+                <span className="text-sm text-gray-600 dark:text-gray-400">
+                  <span className="font-semibold text-[#61caf3]">{selectedFiles.size}</span> file{selectedFiles.size !== 1 ? 's' : ''} selected
+                  {batchStats.valid > 0 && (
+                    <span className="ml-2 text-emerald-600">({batchStats.valid} valid)</span>
+                  )}
+                  {batchStats.invalid > 0 && (
+                    <span className="ml-2 text-red-500">({batchStats.invalid} invalid)</span>
+                  )}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                {batchStats.invalid > 0 && onFix && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleBatchFix}
+                    disabled={batchFixingCount > 0}
+                    className="border-amber-400 text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-950/30 gap-1.5"
+                  >
+                    {batchFixingCount > 0 ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Fixing...
+                      </>
+                    ) : (
+                      <>
+                        <Wrench className="w-3.5 h-3.5" />
+                        Fix {batchStats.invalid}
+                      </>
                     )}
                   </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent className="w-56">
-                  <DropdownMenuLabel>Filter by submodel</DropdownMenuLabel>
-                  <DropdownMenuSeparator />
-                  {allSubmodelOptions.map((name) => (
-                    <DropdownMenuCheckboxItem
-                      key={name}
-                      checked={selectedSubmodels.has(name)}
-                      onCheckedChange={(checked) => {
-                        setSelectedSubmodels((prev) => {
-                          const next = new Set(prev);
-                          if (checked) next.add(name);
-                          else next.delete(name);
-                          return next;
-                        });
-                      }}
-                    >
-                      {name}
-                    </DropdownMenuCheckboxItem>
-                  ))}
-                  <DropdownMenuSeparator />
+                )}
+                {batchStats.valid > 0 && onDownload && (
                   <Button
-                    variant="ghost"
-                    className="w-full justify-start text-gray-600 hover:text-gray-900"
-                    onClick={() => setSelectedSubmodels(new Set())}
+                    size="sm"
+                    variant="outline"
+                    onClick={handleBatchDownload}
+                    className="border-[#61caf3] text-[#61caf3] hover:bg-[#61caf3]/10 gap-1.5"
                   >
-                    Clear filters
+                    <Download className="w-3.5 h-3.5" />
+                    Download {batchStats.valid}
                   </Button>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            )}
-            <Select value={validityFilter} onValueChange={(v) => setValidityFilter(v as "all" | "valid" | "invalid")}>
-              <SelectTrigger className="w-32 bg-white dark:bg-gray-900">
-                <SelectValue placeholder="Validity" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All</SelectItem>
-                <SelectItem value="valid">Valid</SelectItem>
-                <SelectItem value="invalid">Invalid</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-
-        {files.length === 0 ? (
-          <Card className="bg-white dark:bg-gray-800 border-blue-200/70 dark:border-gray-700">
-            <CardContent className="flex items-center gap-3 p-6">
-              <AlertCircle className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-              <div className="text-sm text-gray-700 dark:text-gray-300">
-                You don't have any AAS models loaded yet.
+                )}
+                {batchStats.valid > 0 && onGenerateReport && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleBatchReport}
+                    className="border-emerald-500 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 gap-1.5"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    Report {batchStats.valid}
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleBatchDelete}
+                  className="border-red-400 text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete {selectedFiles.size}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSelectedFiles(new Set())}
+                  className="text-gray-500"
+                >
+                  <X className="w-4 h-4" />
+                </Button>
               </div>
-            </CardContent>
-          </Card>
+            </div>
+          )}
+        </>
+        )}
+
+        {/* Empty State */}
+        {files.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16">
+            <div className="p-6 bg-gradient-to-br from-cyan-100 to-sky-100 dark:from-cyan-900/30 dark:to-sky-900/30 rounded-2xl mb-6">
+              <FolderOpen className="w-16 h-16 text-[#61caf3]" />
+            </div>
+            <h3 className="text-xl font-semibold text-gray-800 dark:text-gray-200 mb-2">No models yet</h3>
+            <p className="text-gray-500 dark:text-gray-400 text-center max-w-md mb-6">
+              Get started by uploading an existing AASX/AAS file or create a new Asset Administration Shell from scratch.
+            </p>
+            <div className="flex gap-3">
+              <Button
+                onClick={onUploadClick}
+                variant="outline"
+                className="border-[#61caf3] text-[#61caf3] hover:bg-[#61caf3]/10 gap-2"
+              >
+                <Upload className="w-4 h-4" />
+                Upload File
+              </Button>
+              <Button
+                onClick={onCreateClick}
+                className="bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white hover:shadow-lg hover:shadow-cyan-500/30 transition-all duration-200 gap-2"
+              >
+                <Plus className="w-4 h-4" />
+                Create New
+              </Button>
+            </div>
+          </div>
         ) : (
           <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {filteredFiles.map((file, idx) => {
+            {filteredFiles.map((file, filteredIdx) => {
+              const actualIndex = files.indexOf(file);
               const idShort = getIdShort(file);
               const thumb = file.thumbnail || "/placeholder.svg";
+              const submodels = extractSubmodelNames(file);
+              const isSelected = selectedFiles.has(actualIndex);
+
               return (
                 <Card
-                  key={`${file.file}-${idx}`}
-                  className={`group relative bg-white dark:bg-gray-800 border-blue-200/70 dark:border-gray-700 hover:border-blue-400 transition-colors cursor-pointer h-44 ${dragOverIndex === idx ? 'ring-2 ring-blue-400' : ''}`}
-                  onClick={() => onOpen(idx)}
+                  key={`${file.file}-${filteredIdx}`}
+                  className={cn(
+                    "group relative bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm",
+                    "border-2 transition-all duration-300 cursor-pointer",
+                    "rounded-xl overflow-hidden",
+                    isSelected
+                      ? "border-[#61caf3] ring-2 ring-[#61caf3]/30 shadow-lg shadow-cyan-500/20"
+                      : "border-gray-200/60 dark:border-gray-700/60 hover:border-[#61caf3]/50 hover:shadow-lg hover:shadow-cyan-500/10",
+                    dragOverIndex === filteredIdx && "ring-2 ring-[#61caf3] ring-offset-2"
+                  )}
+                  onClick={() => onOpen(actualIndex)}
                   draggable
                   onDragStart={(e) => {
-                    setDragIndex(idx);
+                    setDragIndex(actualIndex);
                     e.dataTransfer.effectAllowed = 'move';
                   }}
                   onDragOver={(e) => {
                     e.preventDefault();
-                    if (dragIndex !== null && dragIndex !== idx) setDragOverIndex(idx);
+                    if (dragIndex !== null && dragIndex !== actualIndex) setDragOverIndex(filteredIdx);
                   }}
                   onDragLeave={() => setDragOverIndex(null)}
                   onDrop={(e) => {
                     e.preventDefault();
-                    if (dragIndex !== null && dragIndex !== idx) {
-                      onReorder(dragIndex, idx);
+                    if (dragIndex !== null && dragIndex !== actualIndex) {
+                      onReorder(dragIndex, actualIndex);
                     }
                     setDragIndex(null);
                     setDragOverIndex(null);
@@ -224,74 +533,157 @@ export default function HomeView({ files, onOpen, onUploadClick, onCreateClick, 
                     setDragOverIndex(null);
                   }}
                 >
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="absolute top-2 left-2 z-10 opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete(idx);
-                    }}
-                    aria-label={`Remove ${idShort}`}
-                    draggable={false}
+                  {/* Selection Checkbox */}
+                  <button
+                    onClick={(e) => toggleFileSelection(actualIndex, e)}
+                    className={cn(
+                      "absolute top-2 left-2 z-10 p-1.5 rounded-lg transition-all duration-200",
+                      isSelected
+                        ? "bg-[#61caf3] text-white"
+                        : "bg-white/80 dark:bg-gray-800/80 text-gray-400 opacity-0 group-hover:opacity-100 hover:text-[#61caf3]"
+                    )}
+                    aria-label={isSelected ? `Deselect ${idShort}` : `Select ${idShort}`}
                   >
-                    <X className="w-4 h-4" />
-                  </Button>
+                    {isSelected ? (
+                      <CheckSquare className="w-4 h-4" />
+                    ) : (
+                      <Square className="w-4 h-4" />
+                    )}
+                  </button>
 
+                  {/* Validity Badge */}
                   {file.valid !== undefined && (
-                    <div className="absolute top-2 right-2">
+                    <div className="absolute top-2 right-2 z-10">
                       {file.valid === true ? (
-                        <div className="flex items-center gap-2 rounded-full bg-green-50 border border-green-300 px-3 py-1.5 shadow-sm">
-                          <CheckCircle className="w-6 h-6 text-green-700" />
-                          <span className="text-xs font-semibold text-green-700 uppercase tracking-wide">
+                        <div className="flex items-center gap-1.5 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-700/50 px-2.5 py-1 shadow-sm">
+                          <CheckCircle className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 uppercase tracking-wide">
                             IDTA
                           </span>
                         </div>
                       ) : file.valid === false ? (
-                        <div className="flex items-center gap-2 rounded-full bg-red-50 border border-red-300 px-3 py-1.5 shadow-sm">
-                          <AlertCircle className="w-6 h-6 text-red-700" />
-                          <span className="text-xs font-semibold text-red-700 uppercase tracking-wide">
+                        <div className="flex items-center gap-1.5 rounded-full bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-700/50 px-2.5 py-1 shadow-sm">
+                          <AlertCircle className="w-4 h-4 text-red-600 dark:text-red-400" />
+                          <span className="text-xs font-semibold text-red-700 dark:text-red-400 uppercase tracking-wide">
                             Invalid
                           </span>
                         </div>
                       ) : null}
                     </div>
                   )}
-                  <div className="flex h-full">
-                    {/* Left: Square thumbnail with full card height */}
-                    <div className="ml-12 h-full aspect-square rounded-l overflow-hidden bg-gray-100 flex items-center justify-center">
+
+                  <div className="flex h-44">
+                    {/* Thumbnail */}
+                    <div className="ml-10 h-full aspect-square bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-700 dark:to-gray-800 flex items-center justify-center">
                       {file.thumbnail ? (
                         <img
                           src={thumb}
                           alt={`${idShort} thumbnail`}
-                          className="w-full h-full object-contain"
+                          className="w-full h-full object-contain p-2"
                         />
                       ) : (
-                        <FileText className="w-6 h-6 text-gray-500" />
+                        <div className="p-4 bg-gradient-to-br from-cyan-100 to-sky-100 dark:from-cyan-900/30 dark:to-sky-900/30 rounded-xl">
+                          <FileText className="w-8 h-8 text-[#61caf3]" />
+                        </div>
                       )}
                     </div>
-                    {/* Right: Details and action */}
-                    <div className="flex-1 flex flex-col justify-between p-3">
+
+                    {/* Details */}
+                    <div className="flex-1 flex flex-col justify-between p-4">
                       <div className="min-w-0">
-                        <CardTitle className="truncate text-base text-gray-900 dark:text-gray-100">
+                        <CardTitle className="truncate text-base font-semibold text-gray-900 dark:text-gray-100 mb-1">
                           {idShort}
                         </CardTitle>
-                        <div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                        <div className="text-xs text-gray-500 dark:text-gray-400 truncate mb-2">
                           {file.file}
                         </div>
+                        {submodels.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {submodels.slice(0, 2).map((sm) => (
+                              <span
+                                key={sm}
+                                className="text-[10px] px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded"
+                              >
+                                {sm}
+                              </span>
+                            ))}
+                            {submodels.length > 2 && (
+                              <span className="text-[10px] px-1.5 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded">
+                                +{submodels.length - 2}
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
-                      <div className="flex items-center justify-end">
+
+                      {/* Action Buttons */}
+                      <div className="flex items-center justify-end gap-2 pt-2">
+                        {file.valid === false && onFix && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-amber-400 text-amber-600 hover:bg-amber-50 hover:border-amber-500 dark:hover:bg-amber-950/30 transition-colors text-xs h-7 px-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onFix(actualIndex);
+                            }}
+                            disabled={fixingIndex === actualIndex}
+                          >
+                            {fixingIndex === actualIndex ? (
+                              <>
+                                <Loader2 className="mr-1 w-3 h-3 animate-spin" />
+                                Fixing
+                              </>
+                            ) : (
+                              <>
+                                <Wrench className="mr-1 w-3 h-3" />
+                                Fix
+                              </>
+                            )}
+                          </Button>
+                        )}
+                        {file.valid === true && onDownload && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-[#61caf3] text-[#61caf3] hover:bg-[#61caf3]/10 hover:border-[#4db6e6] transition-colors text-xs h-7 px-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDownload(actualIndex);
+                            }}
+                          >
+                            <Download className="mr-1 w-3 h-3" />
+                            Download
+                          </Button>
+                        )}
+                        {file.valid === true && onGenerateReport && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-emerald-500 text-emerald-600 hover:bg-emerald-50 hover:border-emerald-600 dark:hover:bg-emerald-950/30 transition-colors text-xs h-7 px-2"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onGenerateReport(actualIndex);
+                            }}
+                          >
+                            <FileSpreadsheet className="mr-1 w-3 h-3" />
+                            Report
+                          </Button>
+                        )}
                         <Button
                           size="sm"
-                          variant="outline"
-                          className="group-hover:bg-blue-600 group-hover:text-white group-hover:border-blue-600 transition-colors"
+                          className={cn(
+                            "text-xs h-7 px-3 transition-all duration-200",
+                            "bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white",
+                            "hover:shadow-md hover:shadow-cyan-500/30 hover:scale-[1.02]"
+                          )}
                           onClick={(e) => {
                             e.stopPropagation();
-                            onOpen(idx);
+                            onOpen(actualIndex);
                           }}
                         >
-                          View
-                          <ArrowRight className="ml-1 w-4 h-4" />
+                          Open
+                          <ArrowRight className="ml-1 w-3 h-3" />
                         </Button>
                       </div>
                     </div>

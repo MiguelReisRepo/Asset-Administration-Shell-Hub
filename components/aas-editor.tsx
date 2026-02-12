@@ -1,10 +1,11 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
-import { ChevronRight, ChevronDown, Download, ArrowLeft, FileText, Plus, Trash2, X, Upload, GripVertical, Copy, Eye } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback, useMemo } from "react"
+import { ChevronRight, ChevronDown, Download, ArrowLeft, FileText, Plus, Trash2, X, Upload, GripVertical, Copy, Eye, Wrench, HelpCircle, AlertTriangle, Info, Save, Sparkles, Package, Search, CheckCircle2, ChevronsDownUp, ChevronsUpDown, Home } from 'lucide-react'
 // ADD: extra icons and UI + toast
 import { AlertCircle, CheckCircle } from 'lucide-react'
 import { FileDown } from 'lucide-react'
+import { cn } from "@/lib/utils"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import {
   AlertDialog,
@@ -20,12 +21,20 @@ import JSZip from 'jszip'
 import { validateAASXXml } from "@/lib/xml-validator" // Import the XML validation function
 import type { ValidationResult } from "@/lib/types" // Import ValidationResult type
 import { processFile } from "@/lib/process-file"
-import AasEditorDebugXML from "./aas-editor-debug"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { validateAASXJson } from "@/lib/json-validator"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
+// NEW: Improved validation imports
+import { AlertType, ValidationAlert, ALERT_COLORS, countAlertsByType, countFixableAlerts } from "@/lib/validation-types"
+import { ValidationDialog, ValidationSummary } from "@/components/ui/validation-dialog"
+import { ValidationBadge, ValidationStatus } from "@/components/ui/validation-badge"
+import { ValidatedField, ValidatedFieldWrapper, FieldHelp, AAS_FIELD_HELP } from "@/components/ui/validated-field"
+import { useUnsavedChanges } from "@/hooks/use-unsaved-changes"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { Badge } from "@/components/ui/badge"
+import { ScrollArea } from "@/components/ui/scroll-area"
 
 // Add IEC 61360 data types list
 const IEC_DATA_TYPES = [
@@ -59,6 +68,9 @@ const XSD_VALUE_TYPES = [
 ];
 const XSD_CANON_MAP: Record<string, string> =
   Object.fromEntries(XSD_VALUE_TYPES.map(t => [t.slice(3).toLowerCase(), t]));
+
+// AAS 3.1 namespace constant
+const ns31 = "https://admin-shell.io/aas/3/1";
 
 function normalizeValueType(t?: string): string | undefined {
   if (!t) return undefined;
@@ -157,14 +169,31 @@ interface AASConfig {
   selectedSubmodels: SelectedSubmodel[]
 }
 
+// All supported AAS SubmodelElement types
+type SubmodelElementModelType =
+  | "Property"
+  | "MultiLanguageProperty"
+  | "SubmodelElementCollection"
+  | "SubmodelElementList"
+  | "File"
+  | "Blob"
+  | "Range"
+  | "ReferenceElement"
+  | "Entity"
+  | "Capability"
+  | "Operation"
+  | "BasicEventElement"
+  | "RelationshipElement"
+  | "AnnotatedRelationshipElement"
+
 interface SubmodelElement {
   idShort: string
-  modelType: "Property" | "MultiLanguageProperty" | "SubmodelElementCollection" | "SubmodelElementList" | "File" | "ReferenceElement"
+  modelType: SubmodelElementModelType
   valueType?: string // For Property, Range
-  value?: string | Record<string, string> // For Property, MultiLanguageProperty, File
+  value?: string | Record<string, string> | any // For Property, MultiLanguageProperty, File, Range, etc.
   cardinality: "One" | "ZeroToOne" | "ZeroToMany" | "OneToMany"
   description?: string
-  semanticId?: string
+  semanticId?: string | { keys?: { value?: string }[] }
   children?: SubmodelElement[] // Explicitly for SubmodelElementCollection, SubmodelElementList
   preferredName?: string | Record<string, string>
   shortName?: string | Record<string, string>
@@ -172,6 +201,17 @@ interface SubmodelElement {
   unit?: string
   category?: string
   fileData?: { content: string; mimeType: string; fileName: string } // For File
+  // Range-specific
+  min?: string
+  max?: string
+  // Entity-specific
+  entityType?: "CoManagedEntity" | "SelfManagedEntity"
+  globalAssetId?: string
+  // Blob-specific
+  contentType?: string
+  // ReferenceElement and relationships
+  first?: any // for RelationshipElement
+  second?: any // for RelationshipElement
 }
 
 interface AASEditorProps {
@@ -215,6 +255,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
   const [templateSearchQuery, setSearchQuery] = useState("")
   const [draggedItem, setDraggedItem] = useState<{ path: string[]; element: SubmodelElement } | null>(null)
   const [dragOverItem, setDragOverItem] = useState<string | null>(null)
+  const [dragOverContainer, setDragOverContainer] = useState<string | null>(null) // For nesting into SMC/SML/Entity
 
   const [isGenerating, setIsGenerating] = useState(false)
   // ADD: validation issue states
@@ -247,8 +288,108 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
   const [isFixing, setIsFixing] = useState(false);
   const [validationBusy, setValidationBusy] = useState(false);
 
+  // NEW: Improved validation alerts with severity levels
+  const [validationAlerts, setValidationAlerts] = useState<ValidationAlert[]>([]);
+
   // Add a reentrancy guard ref if not present already
   const validationRunningRef = useRef(false);
+
+  // NEW: Add Element dialog state
+  const [showAddElementDialog, setShowAddElementDialog] = useState(false);
+  const [addElementParentPath, setAddElementParentPath] = useState<string[] | null>(null); // null means root level
+  const [newElementType, setNewElementType] = useState<SubmodelElementModelType>("Property");
+  const [newElementIdShort, setNewElementIdShort] = useState("");
+  const [newElementCardinality, setNewElementCardinality] = useState<"One" | "ZeroToOne" | "ZeroToMany" | "OneToMany">("ZeroToOne");
+  const [newElementDescription, setNewElementDescription] = useState("");
+  const [newElementSemanticId, setNewElementSemanticId] = useState("");
+  const [newElementValueType, setNewElementValueType] = useState("xs:string");
+  const [newElementEntityType, setNewElementEntityType] = useState<"CoManagedEntity" | "SelfManagedEntity">("CoManagedEntity");
+
+  // NEW: Unsaved changes tracking
+  const { hasUnsavedChanges, markAsSaved, confirmNavigation } = useUnsavedChanges(
+    { submodelData, aasConfig },
+    { warningMessage: "You have unsaved changes. Are you sure you want to leave?" }
+  );
+
+  // NEW: Tree search and navigation
+  const [treeSearchQuery, setTreeSearchQuery] = useState("");
+  const [treeSearchFocused, setTreeSearchFocused] = useState(false);
+
+  // Breadcrumb path for selected element
+  const [selectedElementPath, setSelectedElementPath] = useState<string[]>([]);
+
+  // Helper: collect all node IDs recursively for expand/collapse all
+  const collectAllNodeIds = useCallback((elements: SubmodelElement[], parentPath: string[] = []): string[] => {
+    const ids: string[] = [];
+    elements.forEach((el) => {
+      const path = [...parentPath, el.idShort];
+      const nodeId = path.join('/');
+      ids.push(nodeId);
+      if (el.children && el.children.length > 0) {
+        ids.push(...collectAllNodeIds(el.children, path));
+      }
+    });
+    return ids;
+  }, []);
+
+  // Expand all nodes in current submodel
+  const expandAll = useCallback(() => {
+    if (!selectedSubmodel) return;
+    const elements = submodelData[selectedSubmodel.idShort] || [];
+    const allIds = collectAllNodeIds(elements);
+    setExpandedNodes(new Set(allIds));
+  }, [selectedSubmodel, submodelData, collectAllNodeIds]);
+
+  // Collapse all nodes
+  const collapseAll = useCallback(() => {
+    setExpandedNodes(new Set());
+  }, []);
+
+  // Filter elements by search query (recursive)
+  const filterElementsBySearch = useCallback((elements: SubmodelElement[], query: string): SubmodelElement[] => {
+    if (!query.trim()) return elements;
+    const q = query.toLowerCase();
+    const matches = (el: SubmodelElement): boolean => {
+      if (el.idShort.toLowerCase().includes(q)) return true;
+      if (el.children && el.children.some(c => matches(c))) return true;
+      return false;
+    };
+    return elements.filter(matches);
+  }, []);
+
+  // Get filtered elements for current submodel
+  const filteredElements = useMemo(() => {
+    if (!selectedSubmodel) return [];
+    const elements = submodelData[selectedSubmodel.idShort] || [];
+    return filterElementsBySearch(elements, treeSearchQuery);
+  }, [selectedSubmodel, submodelData, treeSearchQuery, filterElementsBySearch]);
+
+  // Check if an element matches search (for highlighting)
+  const elementMatchesSearch = useCallback((idShort: string): boolean => {
+    if (!treeSearchQuery.trim()) return false;
+    return idShort.toLowerCase().includes(treeSearchQuery.toLowerCase());
+  }, [treeSearchQuery]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+F or Cmd+F - Focus tree search
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f' && !e.shiftKey) {
+        e.preventDefault();
+        setTreeSearchFocused(true);
+      }
+      // Delete - Remove selected element (when not in input)
+      if (e.key === 'Delete' && selectedElement && editMode) {
+        const target = e.target as HTMLElement;
+        if (target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA') {
+          e.preventDefault();
+          // Delete would require the path - skipped for now as complex
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedElement, editMode]);
 
   // Any change to AAS content should require re-validation
   useEffect(() => {
@@ -559,13 +700,46 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
 
   const getSemanticId = (element: any): string | undefined => {
     if (element.semanticId) {
-      // Handle different semanticId structures
+      // Handle string semanticId directly
       if (typeof element.semanticId === 'string') {
-        return element.semanticId
+        return element.semanticId.trim() || undefined
       }
-      if (element.semanticId.keys && Array.isArray(element.semanticId.keys)) {
-        const key = element.semanticId.keys[0]
-        return key?.value || undefined
+
+      // Handle Reference object structure: { type, keys: [{ type, value }] }
+      if (typeof element.semanticId === 'object' && element.semanticId !== null) {
+        // Try keys array (standard AAS 3.x structure)
+        if (element.semanticId.keys && Array.isArray(element.semanticId.keys) && element.semanticId.keys.length > 0) {
+          const key = element.semanticId.keys[0]
+          if (typeof key === 'string') {
+            return key.trim() || undefined
+          }
+          if (typeof key === 'object' && key !== null && key.value) {
+            const val = String(key.value).trim()
+            return val || undefined
+          }
+        }
+
+        // Try singular 'key' property (some templates use this)
+        if (element.semanticId.key && Array.isArray(element.semanticId.key) && element.semanticId.key.length > 0) {
+          const key = element.semanticId.key[0]
+          if (typeof key === 'string') {
+            return key.trim() || undefined
+          }
+          if (typeof key === 'object' && key !== null && key.value) {
+            const val = String(key.value).trim()
+            return val || undefined
+          }
+        }
+
+        // Try direct value property (legacy format)
+        if (element.semanticId.value && typeof element.semanticId.value === 'string') {
+          return element.semanticId.value.trim() || undefined
+        }
+
+        // Try id property (some formats use this)
+        if (element.semanticId.id && typeof element.semanticId.id === 'string') {
+          return element.semanticId.id.trim() || undefined
+        }
       }
     }
     return undefined
@@ -772,26 +946,39 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
   }
 
   const hasChildren = (element: SubmodelElement): boolean => {
-    return element.children !== undefined && element.children.length > 0
+    // Collections, lists, and entities can have children even if currently empty
+    const isContainer = element.modelType === "SubmodelElementCollection" ||
+                        element.modelType === "SubmodelElementList" ||
+                        element.modelType === "Entity";
+    return (element.children !== undefined && element.children.length > 0) || isContainer;
   }
 
-  const updateElementValue = (
-    submodelId: string, 
-    path: string[], 
+  // Check if element actually has populated children (for count display)
+  const hasPopulatedChildren = (element: SubmodelElement): boolean => {
+    return element.children !== undefined && element.children.length > 0;
+  }
+
+  // PERF: Instant UI update only - does NOT update submodelData (tree won't re-render)
+  const updateElementValueLocal = (newValue: string | Record<string, string>) => {
+    setSelectedElement(prev => prev ? { ...prev, value: newValue } : null)
+  }
+
+  // PERF: Commit value to submodelData - call this on blur (when user finishes editing)
+  const commitElementValue = (
+    submodelId: string,
+    path: string[],
     newValue: string | Record<string, string>
   ) => {
     setSubmodelData((prev) => {
       const newData = { ...prev }
       const updateInElements = (elements: SubmodelElement[], currentPath: string[]): SubmodelElement[] => {
         if (currentPath.length === 0) return elements
-        
+
         const [current, ...rest] = currentPath
         return elements.map(el => {
           if (el.idShort === current) {
             if (rest.length === 0) {
-              const updated = { ...el, value: newValue }
-              setSelectedElement(updated)
-              return updated
+              return { ...el, value: newValue }
             } else if (el.children) {
               return { ...el, children: updateInElements(el.children, rest) }
             }
@@ -799,10 +986,20 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
           return el
         })
       }
-      
+
       newData[submodelId] = updateInElements(newData[submodelId], path)
       return newData
     })
+  }
+
+  // Legacy function for backwards compatibility - updates both local and global state
+  const updateElementValue = (
+    submodelId: string,
+    path: string[],
+    newValue: string | Record<string, string>
+  ) => {
+    setSelectedElement(prev => prev ? { ...prev, value: newValue } : null)
+    commitElementValue(submodelId, path, newValue)
   }
 
   const updateElementMetadata = (
@@ -811,18 +1008,19 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     field: keyof SubmodelElement,
     newValue: any
   ) => {
+    // PERF: Update selectedElement directly for immediate UI feedback
+    setSelectedElement(prev => prev ? { ...prev, [field]: newValue } : null)
+
     setSubmodelData((prev) => {
       const newData = { ...prev }
       const updateInElements = (elements: SubmodelElement[], currentPath: string[]): SubmodelElement[] => {
         if (currentPath.length === 0) return elements
-        
+
         const [current, ...rest] = currentPath
         return elements.map(el => {
           if (el.idShort === current) {
             if (rest.length === 0) {
-              const updated = { ...el, [field]: newValue }
-              setSelectedElement(updated)
-              return updated
+              return { ...el, [field]: newValue }
             } else if (el.children) {
               return { ...el, children: updateInElements(el.children, rest) }
             }
@@ -830,7 +1028,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
           return el
         })
       }
-      
+
       newData[submodelId] = updateInElements(newData[submodelId], path)
       return newData
     })
@@ -913,6 +1111,91 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     })
   }
 
+  // Move an element from one location to another (including into containers)
+  const moveElement = (submodelId: string, sourcePath: string[], targetPath: string[]) => {
+    // Prevent moving an element into itself or its descendants
+    if (targetPath.join('.').startsWith(sourcePath.join('.'))) {
+      toast.error("Cannot move an element into itself or its children");
+      return;
+    }
+
+    setSubmodelData((prev) => {
+      const newData = { ...prev };
+      let elementToMove: SubmodelElement | null = null;
+
+      // Step 1: Find and remove the element from its source location
+      const removeFromPath = (elements: SubmodelElement[], path: string[]): SubmodelElement[] => {
+        if (path.length === 1) {
+          const idx = elements.findIndex(el => el.idShort === path[0]);
+          if (idx !== -1) {
+            elementToMove = { ...elements[idx] };
+            return elements.filter((_, i) => i !== idx);
+          }
+          return elements;
+        }
+        const [current, ...rest] = path;
+        return elements.map(el => {
+          if (el.idShort === current && el.children) {
+            return { ...el, children: removeFromPath(el.children, rest) };
+          }
+          return el;
+        });
+      };
+
+      // Step 2: Add the element to its target location
+      const addToPath = (elements: SubmodelElement[], path: string[], element: SubmodelElement): SubmodelElement[] => {
+        if (path.length === 0) {
+          // Add at root level - check for duplicate
+          if (elements.some(el => el.idShort === element.idShort)) {
+            toast.error(`An element with idShort "${element.idShort}" already exists at this level`);
+            return elements;
+          }
+          return [...elements, element];
+        }
+        const [current, ...rest] = path;
+        return elements.map(el => {
+          if (el.idShort === current) {
+            const children = el.children || [];
+            if (rest.length === 0) {
+              // This is the target container - add element here
+              if (children.some(c => c.idShort === element.idShort)) {
+                toast.error(`An element with idShort "${element.idShort}" already exists in this container`);
+                return el;
+              }
+              return { ...el, children: [...children, element] };
+            }
+            return { ...el, children: addToPath(children, rest, element) };
+          }
+          return el;
+        });
+      };
+
+      // Remove from source
+      newData[submodelId] = removeFromPath(newData[submodelId] || [], sourcePath);
+
+      // Add to target (if element was found)
+      if (elementToMove) {
+        newData[submodelId] = addToPath(newData[submodelId], targetPath, elementToMove);
+        toast.success(`Moved "${elementToMove.idShort}" to new location`);
+      }
+
+      return newData;
+    });
+
+    // Expand the target container
+    if (targetPath.length > 0) {
+      const nodeId = targetPath.join('.');
+      setExpandedNodes(prev => new Set([...prev, nodeId]));
+    }
+  };
+
+  // Check if an element type can contain children
+  const isContainerType = (modelType: SubmodelElementModelType): boolean => {
+    return modelType === "SubmodelElementCollection" ||
+           modelType === "SubmodelElementList" ||
+           modelType === "Entity";
+  };
+
   const renderTreeNode = (
     element: SubmodelElement, 
     depth: number, 
@@ -932,6 +1215,8 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     // Drag and drop state for styling
     const isDragging = draggedItem?.path.join('.') === nodeId
     const isDragOver = dragOverItem === nodeId
+    const isDropTarget = dragOverContainer === nodeId // For container drop target
+    const isContainer = isContainerType(element.modelType)
 
     const getDisplayValue = (): string => {
       if (element.modelType === "Property") {
@@ -963,52 +1248,81 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
           onDragEnd={() => {
             setDraggedItem(null)
             setDragOverItem(null)
+            setDragOverContainer(null)
           }}
           onDragOver={(e) => {
             e.preventDefault()
             e.dataTransfer.dropEffect = 'move'
             if (!draggedItem) return
-            
-            // Only allow drop if same parent
-            const draggedParentPath = draggedItem.path.slice(0, -1).join('.')
-            const currentParentPath = parentPath.join('.')
-            
-            if (draggedParentPath === currentParentPath) {
-              setDragOverItem(nodeId)
+
+            // Don't allow dropping on self
+            if (draggedItem.path.join('.') === nodeId) return
+
+            // Check if this is a container and the dragged item is not its ancestor
+            if (isContainer && !draggedItem.path.join('.').startsWith(nodeId)) {
+              // Can drop INTO this container
+              setDragOverContainer(nodeId)
+              setDragOverItem(null)
+            } else {
+              // Only allow reorder if same parent
+              const draggedParentPath = draggedItem.path.slice(0, -1).join('.')
+              const currentParentPath = parentPath.join('.')
+
+              if (draggedParentPath === currentParentPath) {
+                setDragOverItem(nodeId)
+                setDragOverContainer(null)
+              }
             }
           }}
-          onDragLeave={() => {
-            setDragOverItem(null)
+          onDragLeave={(e) => {
+            // Only clear if we're actually leaving the element
+            const relatedTarget = e.relatedTarget as HTMLElement
+            if (!e.currentTarget.contains(relatedTarget)) {
+              setDragOverItem(null)
+              setDragOverContainer(null)
+            }
           }}
           onDrop={(e) => {
             e.preventDefault()
+            e.stopPropagation()
             if (!draggedItem || !selectedSubmodel) return
-            
-            // Check if same parent
-            const draggedParentPath = draggedItem.path.slice(0, -1)
-            const currentParentPath = parentPath
-            
-            if (JSON.stringify(draggedParentPath) === JSON.stringify(currentParentPath)) {
-              // Find indices
-              const draggedIndex = siblings.findIndex(el => el.idShort === draggedItem.element.idShort)
-              const targetIndex = index
-              
-              if (draggedIndex !== -1 && draggedIndex !== targetIndex) {
-                reorderElements(selectedSubmodel.idShort, parentPath, draggedIndex, targetIndex)
+
+            const draggedPath = draggedItem.path
+
+            // Check if dropping into a container
+            if (isContainer && dragOverContainer === nodeId) {
+              // Move element into this container
+              moveElement(selectedSubmodel.idShort, draggedPath, path)
+            } else {
+              // Check if same parent for reordering
+              const draggedParentPath = draggedPath.slice(0, -1)
+              const currentParentPath = parentPath
+
+              if (JSON.stringify(draggedParentPath) === JSON.stringify(currentParentPath)) {
+                // Find indices
+                const draggedIndex = siblings.findIndex(el => el.idShort === draggedItem.element.idShort)
+                const targetIndex = index
+
+                if (draggedIndex !== -1 && draggedIndex !== targetIndex) {
+                  reorderElements(selectedSubmodel.idShort, parentPath, draggedIndex, targetIndex)
+                }
               }
             }
-            
+
             setDraggedItem(null)
             setDragOverItem(null)
+            setDragOverContainer(null)
           }}
           className={`flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800 group ${
             isSelected ? "bg-blue-50 dark:bg-blue-900/20 border-l-4 border-[#61caf3]" : ""
           } ${hasValidationError ? "border-2 border-red-500 bg-red-50 dark:bg-red-900/20" : ""}
           ${isDragging ? "opacity-50" : ""}
-          ${isDragOver ? "border-t-2 border-[#61caf3]" : ""}`}
+          ${isDragOver ? "border-t-2 border-[#61caf3]" : ""}
+          ${isDropTarget ? "bg-[#61caf3]/20 border-2 border-[#61caf3] border-dashed rounded-lg" : ""}`}
           style={{ paddingLeft: hasKids ? `${depth * 20 + 12}px` : `${depth * 20 + 12}px` }}
           onClick={() => {
             setSelectedElement(element)
+            setSelectedElementPath(path)
             if (hasKids) toggleNode(nodeId)
           }}
         >
@@ -1028,7 +1342,11 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
             )}
           </div>
           {getTypeBadge(element.modelType)}
-          <span className={`text-sm font-medium flex-1 ${hasValidationError ? 'text-red-700 dark:text-red-400' : ''}`}>
+          <span className={cn(
+            "text-sm font-medium flex-1",
+            hasValidationError && "text-red-700 dark:text-red-400",
+            elementMatchesSearch(element.idShort) && "bg-yellow-200 dark:bg-yellow-900/50 px-1 rounded"
+          )}>
             {element.idShort}
             {displayValue && (
               <span className="text-gray-600 dark:text-gray-400 font-normal ml-2">
@@ -1041,10 +1359,23 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
               <span className="text-red-500 ml-1">*</span>
             )}
           </span>
-          {hasKids && (
+          {hasPopulatedChildren(element) && (
             <span className="text-xs text-gray-500">
               ({element.children?.length || 0})
             </span>
+          )}
+          {/* Add Child button for SMC/SML */}
+          {editMode && (element.modelType === "SubmodelElementCollection" || element.modelType === "SubmodelElementList" || element.modelType === "Entity") && selectedSubmodel && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                openAddElementDialog(path)
+              }}
+              className="p-1 hover:bg-[#61caf3]/20 rounded opacity-0 group-hover:opacity-100 transition-opacity text-[#61caf3]"
+              title="Add child element"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
           )}
           {isDeletable && selectedSubmodel && (
             <button
@@ -1061,9 +1392,38 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
         </div>
         {isExpanded && hasKids && element.children && (
           <div>
-            {element.children.map((child, idx) => 
+            {element.children.map((child, idx) =>
               renderTreeNode(child, depth + 1, [...path, child.idShort], idx, element.children!)
             )}
+            {/* Add child button inside expanded collection */}
+            {editMode && (element.modelType === "SubmodelElementCollection" || element.modelType === "SubmodelElementList" || element.modelType === "Entity") && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  openAddElementDialog(path)
+                }}
+                className="flex items-center gap-2 px-3 py-2 ml-4 mt-1 text-sm text-[#61caf3] hover:bg-[#61caf3]/10 rounded-lg transition-colors"
+                style={{ marginLeft: `${(depth + 1) * 20 + 12}px` }}
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add child element</span>
+              </button>
+            )}
+          </div>
+        )}
+        {/* Show add button when collection is expanded but empty */}
+        {isExpanded && editMode && (element.modelType === "SubmodelElementCollection" || element.modelType === "SubmodelElementList" || element.modelType === "Entity") && (!element.children || element.children.length === 0) && (
+          <div style={{ marginLeft: `${(depth + 1) * 20 + 12}px` }}>
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                openAddElementDialog(path)
+              }}
+              className="flex items-center gap-2 px-3 py-2 text-sm text-[#61caf3] hover:bg-[#61caf3]/10 rounded-lg transition-colors"
+            >
+              <Plus className="w-4 h-4" />
+              <span>Add first child element</span>
+            </button>
           </div>
         )}
       </div>
@@ -1137,12 +1497,22 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       updateElementValue(selectedSubmodel.idShort, elementPath, currentValue)
     }
 
-    const updateMLPLanguageValue = (lang: string, text: string) => {
+    // PERF: Local-only update for instant typing feedback (no tree re-render)
+    const updateMLPLanguageValueLocal = (lang: string, text: string) => {
       if (selectedElement.modelType !== "MultiLanguageProperty") return
-      
+
       const currentValue = typeof selectedElement.value === 'object' && selectedElement.value !== null ? { ...selectedElement.value } : { en: '' }
       currentValue[lang] = text
-      updateElementValue(selectedSubmodel.idShort, elementPath, currentValue)
+      updateElementValueLocal(currentValue)
+    }
+
+    // PERF: Commit to global state (call on blur)
+    const commitMLPLanguageValue = (lang: string, text: string) => {
+      if (selectedElement.modelType !== "MultiLanguageProperty") return
+
+      const currentValue = typeof selectedElement.value === 'object' && selectedElement.value !== null ? { ...selectedElement.value } : { en: '' }
+      currentValue[lang] = text
+      commitElementValue(selectedSubmodel.idShort, elementPath, currentValue)
     }
 
     return (
@@ -1155,8 +1525,8 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
           <h3 className="font-semibold text-lg">{selectedElement.idShort}</h3>
         </div>
 
-        <div className="space-y-3 bg-green-50 dark:bg-green-900/20 rounded-lg p-3">
-          <h4 className="text-sm font-semibold text-green-800 dark:text-green-300 uppercase">
+        <div className="space-y-3 bg-gradient-to-br from-cyan-50 to-sky-50 dark:from-cyan-900/20 dark:to-sky-900/20 rounded-lg p-3 border border-cyan-100 dark:border-cyan-800/30">
+          <h4 className="text-sm font-semibold text-cyan-700 dark:text-cyan-300 uppercase tracking-wide">
             Value {isRequired && <span className="text-red-500">*</span>}
           </h4>
 
@@ -1166,7 +1536,12 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
                 type="text"
                 value={typeof selectedElement.value === 'string' ? selectedElement.value : ''}
                 onChange={(e) => {
-                  updateElementValue(selectedSubmodel.idShort, elementPath, e.target.value)
+                  // PERF: Only update local UI state (instant feedback, no tree re-render)
+                  updateElementValueLocal(e.target.value)
+                }}
+                onBlur={(e) => {
+                  // PERF: Commit to global state only when done editing (tree re-renders once)
+                  commitElementValue(selectedSubmodel.idShort, elementPath, e.target.value)
                 }}
                 placeholder={`Enter ${selectedElement.idShort}...`}
                 className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-900 focus:ring-2 focus:ring-[#61caf3] focus:border-transparent"
@@ -1185,7 +1560,8 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
                     <input
                       type="text"
                       value={text}
-                      onChange={(e) => updateMLPLanguageValue(lang, e.target.value)}
+                      onChange={(e) => updateMLPLanguageValueLocal(lang, e.target.value)}
+                      onBlur={(e) => commitMLPLanguageValue(lang, e.target.value)}
                       placeholder={`Enter ${selectedElement.idShort} in ${lang}...`}
                       className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-900 focus:ring-2 focus:ring-[#61caf3] focus:border-transparent"
                     />
@@ -1263,10 +1639,10 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
                 </label>
               
               {selectedElement.fileData && (
-                <div className="bg-green-50 dark:bg-green-900/20 rounded-lg p-3 space-y-2">
+                <div className="bg-gradient-to-br from-cyan-50 to-sky-50 dark:from-cyan-900/20 dark:to-sky-900/20 rounded-lg p-3 space-y-2 border border-cyan-200/50 dark:border-cyan-700/30">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <FileText className="w-5 h-5 text-green-600" />
+                      <FileText className="w-5 h-5 text-cyan-600" />
                       <div>
                         <div className="text-sm font-medium text-gray-900 dark:text-gray-100">
                           {selectedElement.fileData.fileName}
@@ -1309,7 +1685,12 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
                   type="text"
                   value={typeof selectedElement.value === 'string' ? selectedElement.value : ''}
                   onChange={(e) => {
-                    updateElementValue(selectedSubmodel.idShort, elementPath, e.target.value)
+                    // PERF: Only update local UI state (instant feedback)
+                    updateElementValueLocal(e.target.value)
+                  }}
+                  onBlur={(e) => {
+                    // PERF: Commit to global state on blur
+                    commitElementValue(selectedSubmodel.idShort, elementPath, e.target.value)
                   }}
                   placeholder="/files/manual-path.pdf or https://..."
                   className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-900 focus:ring-2 focus:ring-[#61caf3] focus:border-transparent text-sm"
@@ -1544,6 +1925,51 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
   const buildCurrentXml = (): string => {
     const collectedConceptDescriptions: Record<string, ConceptDescription> = {};
 
+    // Collect all unique concept descriptions from elements with semanticId
+    const collectConcepts = (elements: SubmodelElement[]) => {
+      elements.forEach(element => {
+        // Extract semanticId value - handle both string and object formats
+        let conceptId = "";
+        if (typeof element.semanticId === "string") {
+          conceptId = element.semanticId.trim();
+        } else if (element.semanticId && typeof element.semanticId === "object") {
+          if (Array.isArray(element.semanticId.keys) && element.semanticId.keys.length > 0) {
+            const key = element.semanticId.keys[0];
+            conceptId = typeof key === "string" ? key : (key?.value || "");
+          } else if (Array.isArray(element.semanticId.key) && element.semanticId.key.length > 0) {
+            const key = element.semanticId.key[0];
+            conceptId = typeof key === "string" ? key : (key?.value || "");
+          } else if (element.semanticId.value) {
+            conceptId = String(element.semanticId.value);
+          }
+        }
+        conceptId = conceptId.trim();
+
+        if (conceptId && !collectedConceptDescriptions[conceptId]) {
+          collectedConceptDescriptions[conceptId] = {
+            id: conceptId,
+            idShort: element.idShort,
+            preferredName: typeof element.preferredName === 'string' ? { en: element.preferredName } : element.preferredName,
+            shortName: typeof element.shortName === 'string' ? { en: element.shortName } : element.shortName,
+            description: element.description,
+            dataType: element.dataType,
+            unit: element.unit,
+            category: element.category,
+            valueType: element.valueType,
+          };
+        }
+        if (element.children) {
+          collectConcepts(element.children);
+        }
+      });
+    };
+
+    // Collect concepts from all submodels
+    aasConfig.selectedSubmodels.forEach(sm => {
+      const elements = submodelData[sm.idShort] || [];
+      collectConcepts(elements);
+    });
+
     // ... existing helper defs ...
 
     // NEW helpers for asset information normalization and derivation
@@ -1597,7 +2023,8 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     // NEW: prebuild assetInformation fragments
     const assetKindXmlVal = normalizeAssetKind(aasConfig.assetKind);
     const gaiVal = deriveGlobalAssetIdValue();
-    const globalAssetIdXml = `        <globalAssetId keys="AssetGlobalIdentifier=${escapeXml(gaiVal)}"/>
+    // AAS 3.1: globalAssetId is a simple string, not a reference with keys attribute
+    const globalAssetIdXml = `        <globalAssetId>${escapeXml(gaiVal)}</globalAssetId>
 `;
     const mpn = deriveManufacturerPartId();
     const specificAssetIdsXml = mpn
@@ -1613,6 +2040,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     const submodelsXml = aasConfig.selectedSubmodels.map(sm => {
       const elements = submodelData[sm.idShort] || [];
       const smIdShortSan = sanitizeIdShortJson(sm.idShort);
+      // AAS 3.1: key elements must have type and value as child elements, not attributes
       return `    <submodel>
       <idShort>${escapeXml(smIdShortSan)}</idShort>
       <id>${escapeXml(`${aasConfig.id}/submodels/${smIdShortSan}`)}</id>
@@ -1620,7 +2048,10 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       <semanticId>
         <type>ExternalReference</type>
         <keys>
-          <key type="GlobalReference" value="${escapeXml(sm.template.url || ('https://admin-shell.io/submodels/' + smIdShortSan))}"/>
+          <key>
+            <type>GlobalReference</type>
+            <value>${escapeXml(sm.template.url || ('https://admin-shell.io/submodels/' + smIdShortSan))}</value>
+          </key>
         </keys>
       </semanticId>
       <submodelElements>
@@ -1637,61 +2068,71 @@ ${elements.map(el => generateElementXml(el, "        ")).join('')}      </submod
 
       const preferredXml = Object.entries(ensuredPreferredName).map(([lang, text]) => {
         if (!text || String(text).trim() === "") return "";
-        return `${indent}      <langStringPreferredNameTypeIec61360>
-${indent}        <language>${escapeXml(lang)}</language>
-${indent}        <text>${escapeXml(text)}</text>
-${indent}      </langStringPreferredNameTypeIec61360>`;
+        return `${indent}            <langStringPreferredNameTypeIec61360>
+${indent}              <language>${escapeXml(lang)}</language>
+${indent}              <text>${escapeXml(text)}</text>
+${indent}            </langStringPreferredNameTypeIec61360>`;
       }).filter(Boolean).join("\n");
 
       const shortNameXml = concept.shortName
         ? Object.entries(concept.shortName).map(([lang, text]) => {
             if (!text || String(text).trim() === "") return "";
-            return `${indent}      <langStringShortNameTypeIec61360>
-${indent}        <language>${escapeXml(lang)}</language>
-${indent}        <text>${escapeXml(text)}</text>
-${indent}      </langStringShortNameTypeIec61360>`;
+            return `${indent}            <langStringShortNameTypeIec61360>
+${indent}              <language>${escapeXml(lang)}</language>
+${indent}              <text>${escapeXml(text)}</text>
+${indent}            </langStringShortNameTypeIec61360>`;
           }).filter(Boolean).join("\n")
         : "";
 
-      const unitXml = concept.unit ? `${indent}    <unit>${escapeXml(concept.unit)}</unit>` : "";
-      const dataTypeXml = concept.dataType ? `${indent}    <dataType>${escapeXml(concept.dataType)}</dataType>` : "";
+      const unitXml = concept.unit ? `${indent}          <unit>${escapeXml(concept.unit)}</unit>` : "";
+      const dataTypeXml = concept.dataType ? `${indent}          <dataType>${escapeXml(concept.dataType)}</dataType>` : "";
       const definitionXml = concept.description
-        ? `${indent}    <definition>
-${indent}      <langStringDefinitionTypeIec61360>
-${indent}        <language>en</language>
-${indent}        <text>${escapeXml(concept.description)}</text>
-${indent}      </langStringDefinitionTypeIec61360>
-${indent}    </definition>`
+        ? `${indent}          <definition>
+${indent}            <langStringDefinitionTypeIec61360>
+${indent}              <language>en</language>
+${indent}              <text>${escapeXml(concept.description)}</text>
+${indent}            </langStringDefinitionTypeIec61360>
+${indent}          </definition>`
         : "";
 
+      // AAS 3.1: ConceptDescription uses embeddedDataSpecifications (not dataSpecifications)
       return `${indent}<conceptDescription>
 ${indent}  <idShort>${escapeXml(cdIdShortSan)}</idShort>
 ${indent}  <id>${escapeXml(concept.id)}</id>
-${indent}  <dataSpecifications>
-${indent}    <dataSpecification>
-${indent}      <type>ExternalReference</type>
-${indent}      <keys>
-${indent}        <key type="GlobalReference" value="https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360"/>
-${indent}      </keys>
-${indent}    </dataSpecification>
-${indent}    <dataSpecificationContent>
-${indent}      <dataSpecificationIec61360>
-${indent}        <preferredName>
+${indent}  <embeddedDataSpecifications>
+${indent}    <embeddedDataSpecification>
+${indent}      <dataSpecification>
+${indent}        <type>ExternalReference</type>
+${indent}        <keys>
+${indent}          <key>
+${indent}            <type>GlobalReference</type>
+${indent}            <value>https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360</value>
+${indent}          </key>
+${indent}        </keys>
+${indent}      </dataSpecification>
+${indent}      <dataSpecificationContent>
+${indent}        <dataSpecificationIec61360>
+${indent}          <preferredName>
 ${preferredXml}
-${indent}        </preferredName>
-${shortNameXml ? `${indent}        <shortName>\n${shortNameXml}\n${indent}        </shortName>` : ""}
-${unitXml ? unitXml + "\n" : ""}${dataTypeXml ? dataTypeXml + "\n" : ""}${definitionXml ? definitionXml + "\n" : ""}${indent}      </dataSpecificationIec61360>
-${indent}    </dataSpecificationContent>
-${indent}  </dataSpecifications>
+${indent}          </preferredName>
+${shortNameXml ? `${indent}          <shortName>\n${shortNameXml}\n${indent}          </shortName>` : ""}
+${unitXml ? unitXml + "\n" : ""}${dataTypeXml ? dataTypeXml + "\n" : ""}${definitionXml ? definitionXml + "\n" : ""}${indent}        </dataSpecificationIec61360>
+${indent}      </dataSpecificationContent>
+${indent}    </embeddedDataSpecification>
+${indent}  </embeddedDataSpecifications>
 ${indent}</conceptDescription>`;
     }).join('\n');
 
     const submodelRefs = aasConfig.selectedSubmodels.map(sm => {
       const smIdShortSan = sanitizeIdShortJson(sm.idShort);
+      // AAS 3.1: key elements must have type and value as child elements
       return `        <reference>
           <type>ModelReference</type>
           <keys>
-            <key type="Submodel" value="${escapeXml(`${aasConfig.id}/submodels/${smIdShortSan}`)}"/>
+            <key>
+              <type>Submodel</type>
+              <value>${escapeXml(`${aasConfig.id}/submodels/${smIdShortSan}`)}</value>
+            </key>
           </keys>
         </reference>`;
     }).join('\n');
@@ -1766,8 +2207,10 @@ ${conceptXml}
         base.description = [{ language: 'en', text: descText }];
       }
 
-      if (element.semanticId) {
+      // Skip semanticId for ReferenceElement (not allowed per AAS 3.1 schema)
+      if (element.semanticId && element.modelType !== "ReferenceElement") {
         base.semanticId = {
+          type: "ExternalReference",
           keys: [{ type: "GlobalReference", value: element.semanticId }]
         };
       }
@@ -1816,11 +2259,38 @@ ${conceptXml}
             ...base,
             value: Array.isArray(element.children) ? element.children.map(mapElementToJson) : [],
           };
-        case "ReferenceElement":
+        case "ReferenceElement": {
+          // ReferenceElement value should be a proper Reference object
+          const refValue = element.value;
+          let valueRef: any;
+          if (refValue && typeof refValue === 'object' && Array.isArray(refValue.keys) && refValue.keys.length > 0) {
+            // Normalize keys - handle both string keys and object keys
+            const normalizedKeys = refValue.keys.map((k: any) => {
+              if (typeof k === 'string') {
+                return { type: "GlobalReference", value: k };
+              } else if (typeof k === 'object' && k !== null) {
+                return { type: k.type || "GlobalReference", value: k.value || "" };
+              }
+              return { type: "GlobalReference", value: "" };
+            });
+            valueRef = {
+              type: refValue.type || "ExternalReference",
+              keys: normalizedKeys
+            };
+          } else {
+            const fallbackVal = (typeof refValue === 'string' ? refValue.trim() : '') || (element.semanticId || '').trim();
+            if (fallbackVal) {
+              valueRef = {
+                type: "ExternalReference",
+                keys: [{ type: "GlobalReference", value: fallbackVal }]
+              };
+            }
+          }
           return {
             ...base,
-            value: element.value
+            value: valueRef
           };
+        }
         default:
           return base;
       }
@@ -1834,6 +2304,7 @@ ${conceptXml}
         id: `${aasConfig.id}/submodels/${smIdShortSan}`,
         kind: "Instance",
         semanticId: {
+          type: "ExternalReference",
           keys: [{
             type: "GlobalReference",
             value: sm.template.url || `https://admin-shell.io/submodels/${smIdShortSan}`
@@ -1849,13 +2320,12 @@ ${conceptXml}
       idShort: shellIdShortSan,
       assetInformation: {
         assetKind: aasConfig.assetKind,
-        globalAssetId: {
-          type: "ExternalReference",
-          keys: [{ type: "AssetGlobalIdentifier", value: aasConfig.globalAssetId || sanitizeIdShortJson(aasConfig.idShort || "") }],
-        },
+        // AAS 3.1: globalAssetId is a simple string, not a reference with keys
+        globalAssetId: aasConfig.globalAssetId || sanitizeIdShortJson(aasConfig.idShort || ""),
         ...(aasConfig.selectedSubmodels.length > 0 ? { specificAssetIds: [] } : {}),
       },
       submodels: jsonSubmodels.map(sm => ({
+        type: "ModelReference",
         keys: [
           {
             type: "Submodel",
@@ -1880,6 +2350,7 @@ ${conceptXml}
               embeddedDataSpecifications: [
                 {
                   dataSpecification: {
+                    type: "ExternalReference",
                     keys: [
                       { type: "GlobalReference", value: "https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360" }
                     ]
@@ -1915,6 +2386,7 @@ ${conceptXml}
   }
 
   // Generate XML for a SubmodelElement (AAS 3.1)
+  // Element order per schema: category, idShort, description, semanticId, embeddedDataSpecifications, [type-specific content]
   function generateElementXml(element: SubmodelElement, indent: string = "      "): string {
     const typeKey = String(element.modelType || "Property").toLowerCase();
     const tagName =
@@ -1927,6 +2399,7 @@ ${conceptXml}
       "property";
 
     const isReference = tagName === "referenceElement";
+    const isCollection = tagName === "submodelElementCollection" || tagName === "submodelElementList";
 
     let xml = `${indent}<${tagName}>\n`;
 
@@ -1949,84 +2422,56 @@ ${conceptXml}
       xml += `${indent}  </description>\n`;
     }
 
-    // Type-specific content
-    if (tagName === "property") {
-      const vt = normalizeValueType(element.valueType) || deriveValueTypeFromIEC(element.dataType) || "xs:string";
-      xml += `${indent}  <valueType>${escapeXml(vt)}</valueType>\n`;
-      const valStr = typeof element.value === "string" ? element.value.trim() : "";
-      if (valStr) {
-        xml += `${indent}  <value>${escapeXml(valStr)}</value>\n`;
-      } else {
-        xml += `${indent}  <value/>\n`;
-      }
-    } else if (tagName === "multiLanguageProperty") {
-      const entries = (element.value && typeof element.value === "object")
-        ? Object.entries(element.value as Record<string, string>).filter(([, t]) => t && String(t).trim() !== "")
-        : [];
-      if (entries.length > 0) {
-        xml += `${indent}  <value>\n`;
-        for (const [lang, text] of entries) {
-          xml += `${indent}    <langStringTextType>\n`;
-          xml += `${indent}      <language>${escapeXml(lang)}</language>\n`;
-          xml += `${indent}      <text>${escapeXml(text)}</text>\n`;
-          xml += `${indent}    </langStringTextType>\n`;
-        }
-        xml += `${indent}  </value>\n`;
-      } else {
-        xml += `${indent}  <value/>\n`;
-      }
-    } else if (tagName === "file") {
-      const contentType = (element.fileData?.mimeType || "application/octet-stream").trim();
-      xml += `${indent}  <contentType>${escapeXml(contentType)}</contentType>\n`;
-      const valStr = typeof element.value === "string" ? element.value.trim() : "";
-      if (valStr) {
-        xml += `${indent}  <value>${escapeXml(valStr)}</value>\n`;
-      } else {
-        xml += `${indent}  <value/>\n`;
-      }
-    } else if (tagName === "submodelElementCollection" || tagName === "submodelElementList") {
-      const kids = Array.isArray(element.children) ? element.children : [];
-      if (kids.length > 0) {
-        xml += `${indent}  <value>\n`;
-        for (const child of kids) {
-          xml += generateElementXml(child, indent + "    ");
-        }
-        xml += `${indent}  </value>\n`;
-      }
-    } else if (tagName === "referenceElement") {
-      // ReferenceElement must contain valueId (Reference). No <value>, no IEC61360.
-      const v: any = element.value;
-      const hasKeys = v && typeof v === "object" && Array.isArray(v.keys) && v.keys.length > 0;
-      const fallback = (typeof v === "string" ? v.trim() : "") || (element.semanticId || "").trim();
-      xml += `${indent}  <valueId>\n`;
-      xml += `${indent}    <type>ExternalReference</type>\n`;
-      xml += `${indent}    <keys>\n`;
-      if (hasKeys) {
-        for (const k of v.keys as any[]) {
-          xml += `${indent}      <key type="${escapeXml(k.type || "GlobalReference")}" value="${escapeXml(k.value || "")}"/>\n`;
-        }
-      } else if (fallback) {
-        xml += `${indent}      <key type="GlobalReference" value="${escapeXml(fallback)}"/>\n`;
-      }
-      xml += `${indent}    </keys>\n`;
-      xml += `${indent}  </valueId>\n`;
-    }
-
-    // semanticId (skip for ReferenceElement)
+    // semanticId (skip for ReferenceElement) - MUST come before type-specific content per AAS 3.1 schema
     if (element.semanticId && !isReference) {
-      const sem = String(element.semanticId).trim();
-      if (sem) {
+      // Extract semanticId value - handle both string and object formats
+      let sem = "";
+      if (typeof element.semanticId === "string") {
+        sem = element.semanticId.trim();
+      } else if (typeof element.semanticId === "object" && element.semanticId !== null) {
+        // Handle Reference structure: { type, keys: [{ type, value }] }
+        if (Array.isArray(element.semanticId.keys) && element.semanticId.keys.length > 0) {
+          const key = element.semanticId.keys[0];
+          if (typeof key === "string") {
+            sem = key.trim();
+          } else if (typeof key === "object" && key !== null && key.value) {
+            sem = String(key.value).trim();
+          }
+        }
+        // Try singular 'key' property (some templates use this)
+        else if (Array.isArray(element.semanticId.key) && element.semanticId.key.length > 0) {
+          const key = element.semanticId.key[0];
+          if (typeof key === "string") {
+            sem = key.trim();
+          } else if (typeof key === "object" && key !== null && key.value) {
+            sem = String(key.value).trim();
+          }
+        }
+        // Try direct value property (legacy format)
+        else if (element.semanticId.value && typeof element.semanticId.value === "string") {
+          sem = element.semanticId.value.trim();
+        }
+        // Try id property (some formats use this)
+        else if (element.semanticId.id && typeof element.semanticId.id === "string") {
+          sem = element.semanticId.id.trim();
+        }
+      }
+      if (sem && sem !== "[object Object]") {
         xml += `${indent}  <semanticId>\n`;
         xml += `${indent}    <type>ExternalReference</type>\n`;
         xml += `${indent}    <keys>\n`;
-        xml += `${indent}      <key type="GlobalReference" value="${escapeXml(sem)}"/>\n`;
+        xml += `${indent}      <key>\n`;
+        xml += `${indent}        <type>GlobalReference</type>\n`;
+        xml += `${indent}        <value>${escapeXml(sem)}</value>\n`;
+        xml += `${indent}      </key>\n`;
         xml += `${indent}    </keys>\n`;
         xml += `${indent}  </semanticId>\n`;
       }
     }
 
-    // embeddedDataSpecifications (IEC 61360) — only when actual meta exists and NOT for ReferenceElement
-    if (!isReference) {
+    // embeddedDataSpecifications (IEC 61360) - MUST come before type-specific content per AAS 3.1 schema
+    // Only for Property and MultiLanguageProperty (not for ReferenceElement, File, or Collections)
+    if (!isReference && !isCollection && tagName !== "file") {
       const hasPref = (() => {
         if (!element.preferredName) return false;
         if (typeof element.preferredName === "string") return element.preferredName.trim() !== "";
@@ -2039,9 +2484,8 @@ ${conceptXml}
       })();
       const hasUnit = !!(element.unit && element.unit.trim() !== "");
       const hasDt = !!(element.dataType && element.dataType.trim() !== "");
-      const hasDef = !!(element.description && String(element.description).trim() !== "");
 
-      if (hasPref || hasShort || hasUnit || hasDt || hasDef) {
+      if (hasPref || hasShort || hasUnit || hasDt) {
         const prefObj = typeof element.preferredName === "string" ? { en: element.preferredName } : (element.preferredName || {});
         const shortObj = typeof element.shortName === "string" ? { en: element.shortName } : (element.shortName || {});
 
@@ -2074,7 +2518,10 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         xml += `${indent}      <dataSpecification>\n`;
         xml += `${indent}        <type>ExternalReference</type>\n`;
         xml += `${indent}        <keys>\n`;
-        xml += `${indent}          <key type="GlobalReference" value="https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360"/>\n`;
+        xml += `${indent}          <key>\n`;
+        xml += `${indent}            <type>GlobalReference</type>\n`;
+        xml += `${indent}            <value>https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360</value>\n`;
+        xml += `${indent}          </key>\n`;
         xml += `${indent}        </keys>\n`;
         xml += `${indent}      </dataSpecification>\n`;
         xml += `${indent}      <dataSpecificationContent>\n`;
@@ -2093,20 +2540,88 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         if (hasDt) {
           xml += `${indent}          <dataType>${escapeXml(element.dataType!)}</dataType>\n`;
         }
-        if (hasDef) {
-          const d = typeof element.description === "string" ? element.description : String(element.description);
-          xml += `${indent}          <definition>\n`;
-          xml += `${indent}            <langStringDefinitionTypeIec61360>\n`;
-          xml += `${indent}              <language>en</language>\n`;
-          xml += `${indent}              <text>${escapeXml(d)}</text>\n`;
-          xml += `${indent}            </langStringDefinitionTypeIec61360>\n`;
-          xml += `${indent}          </definition>\n`;
-        }
         xml += `${indent}        </dataSpecificationIec61360>\n`;
         xml += `${indent}      </dataSpecificationContent>\n`;
         xml += `${indent}    </embeddedDataSpecification>\n`;
         xml += `${indent}  </embeddedDataSpecifications>\n`;
       }
+    }
+
+    // Type-specific content (MUST come after semanticId and embeddedDataSpecifications per AAS 3.1 schema)
+    if (tagName === "property") {
+      const vt = normalizeValueType(element.valueType) || deriveValueTypeFromIEC(element.dataType) || "xs:string";
+      xml += `${indent}  <valueType>${escapeXml(vt)}</valueType>\n`;
+      const valStr = typeof element.value === "string" ? element.value.trim() : "";
+      if (valStr) {
+        xml += `${indent}  <value>${escapeXml(valStr)}</value>\n`;
+      } else {
+        xml += `${indent}  <value/>\n`;
+      }
+    } else if (tagName === "multiLanguageProperty") {
+      const entries = (element.value && typeof element.value === "object")
+        ? Object.entries(element.value as Record<string, string>).filter(([, t]) => t && String(t).trim() !== "")
+        : [];
+      // Only output value if there are actual entries; empty value element is invalid per schema
+      if (entries.length > 0) {
+        xml += `${indent}  <value>\n`;
+        for (const [lang, text] of entries) {
+          xml += `${indent}    <langStringTextType>\n`;
+          xml += `${indent}      <language>${escapeXml(lang)}</language>\n`;
+          xml += `${indent}      <text>${escapeXml(text)}</text>\n`;
+          xml += `${indent}    </langStringTextType>\n`;
+        }
+        xml += `${indent}  </value>\n`;
+      }
+      // Do NOT output <value/> for MultiLanguageProperty - schema requires langStringTextType children
+    } else if (tagName === "file") {
+      const contentType = (element.fileData?.mimeType || "application/octet-stream").trim();
+      xml += `${indent}  <contentType>${escapeXml(contentType)}</contentType>\n`;
+      const valStr = typeof element.value === "string" ? element.value.trim() : "";
+      if (valStr) {
+        xml += `${indent}  <value>${escapeXml(valStr)}</value>\n`;
+      }
+      // Do NOT output <value/> for File - value is optional
+    } else if (tagName === "submodelElementCollection" || tagName === "submodelElementList") {
+      const kids = Array.isArray(element.children) ? element.children : [];
+      if (kids.length > 0) {
+        xml += `${indent}  <value>\n`;
+        for (const child of kids) {
+          xml += generateElementXml(child, indent + "    ");
+        }
+        xml += `${indent}  </value>\n`;
+      }
+    } else if (tagName === "referenceElement") {
+      // ReferenceElement: only value is allowed (no semanticId, no embeddedDataSpecifications)
+      const v: any = element.value;
+      const hasKeys = v && typeof v === "object" && Array.isArray(v.keys) && v.keys.length > 0;
+      const fallback = (typeof v === "string" ? v.trim() : "") || (element.semanticId || "").trim();
+      xml += `${indent}  <value>\n`;
+      xml += `${indent}    <type>ExternalReference</type>\n`;
+      xml += `${indent}    <keys>\n`;
+      if (hasKeys) {
+        for (const k of v.keys as any[]) {
+          // Handle keys that might be strings or objects
+          const keyType = (typeof k === "object" && k !== null) ? (k.type || "GlobalReference") : "GlobalReference";
+          const keyValue = (typeof k === "object" && k !== null) ? (k.value || "") : (typeof k === "string" ? k : "");
+          xml += `${indent}      <key>\n`;
+          xml += `${indent}        <type>${escapeXml(keyType)}</type>\n`;
+          xml += `${indent}        <value>${escapeXml(keyValue)}</value>\n`;
+          xml += `${indent}      </key>\n`;
+        }
+      } else if (fallback) {
+        xml += `${indent}      <key>\n`;
+        xml += `${indent}        <type>GlobalReference</type>\n`;
+        xml += `${indent}        <value>${escapeXml(fallback)}</value>\n`;
+        xml += `${indent}      </key>\n`;
+      } else {
+        // No keys and no fallback - provide empty placeholder key to satisfy schema
+        xml += `${indent}      <key>\n`;
+        xml += `${indent}        <type>GlobalReference</type>\n`;
+        xml += `${indent}        <value></value>\n`;
+        xml += `${indent}      </key>\n`;
+      }
+      xml += `${indent}    </keys>\n`;
+      xml += `${indent}  </value>\n`;
     }
 
     xml += `${indent}</${tagName}>\n`;
@@ -2115,7 +2630,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
 
   const generateFinalAAS = async () => {
     setIsGenerating(true)
-    
+
     // Helper to prefix XML schema types for valueType
     const prefixXs = (type: string | undefined) => {
       if (!type) return undefined;
@@ -2293,6 +2808,9 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       // Store for debugging and perform XML schema validation
       setLastGeneratedXml(aasXml)
       console.log("[v0] EDITOR: Starting XML schema validation for generated AAS...")
+      console.log("[v0] EDITOR: Generated XML length:", aasXml.length)
+      // Debug: Log the first 2000 characters to verify structure
+      console.log("[v0] EDITOR: XML preview:", aasXml.substring(0, 2000))
       const xmlValidationResult = await validateAASXXml(aasXml)
 
       if (!xmlValidationResult.valid) {
@@ -2326,8 +2844,10 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
             const descText = typeof element.description === 'string' ? element.description : String(element.description);
             base.description = [{ language: 'en', text: descText }];
           }
-          if (element.semanticId) {
+          // AAS 3.1: semanticId requires type field; skip for ReferenceElement (not allowed)
+          if (element.semanticId && element.modelType !== "ReferenceElement") {
             base.semanticId = {
+              type: "ExternalReference",
               keys: [{ type: "GlobalReference", value: element.semanticId }]
             };
           }
@@ -2391,6 +2911,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
             id: `${aasConfig.id}/submodels/${sm.idShort}`,
             kind: "Instance",
             semanticId: {
+              type: "ExternalReference",
               keys: [{
                 type: "GlobalReference",
                 value: sm.template.url || `https://admin-shell.io/submodels/${sm.idShort}`
@@ -2405,13 +2926,12 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
           idShort: aasConfig.idShort,
           assetInformation: {
             assetKind: aasConfig.assetKind,
-            globalAssetId: {
-              type: "ExternalReference",
-              keys: [{ type: "AssetGlobalIdentifier", value: aasConfig.globalAssetId || sanitizeIdShortJson(aasConfig.idShort || "") }],
-            },
+            // AAS 3.1: globalAssetId is a simple string
+            globalAssetId: aasConfig.globalAssetId || sanitizeIdShortJson(aasConfig.idShort || ""),
             ...(aasConfig.selectedSubmodels.length > 0 ? { specificAssetIds: [] } : {}),
           },
           submodels: aasConfig.selectedSubmodels.map(sm => ({
+            type: "ModelReference",
             keys: [{
               type: "Submodel",
               value: `${aasConfig.id}/submodels/${sm.idShort}`
@@ -2438,6 +2958,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
             embeddedDataSpecifications: [
               {
                 dataSpecification: {
+                  type: "ExternalReference",
                   keys: [
                     { type: "GlobalReference", value: "https://admin-shell.io/DataSpecificationTemplates/DataSpecificationIEC61360" }
                   ]
@@ -2493,17 +3014,21 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
           addFilesFromElements(elements)
         })
         
-        if (thumbnail && thumbnailFileName) {
-          // Convert base64 data URL to blob
-          const base64Data = thumbnail.split(',')[1]
-          const binaryData = atob(base64Data)
-          const arrayBuffer = new ArrayBuffer(binaryData.length)
-          const uint8Array = new Uint8Array(arrayBuffer)
-          for (let i = 0; i < binaryData.length; i++) {
-            uint8Array[i] = binaryData.charCodeAt(i)
+        // Add thumbnail (if present) to the root
+        if (thumbnail) {
+          const mimeTypeMatch = thumbnail.match(/^data:(image\/(png|jpeg|gif|svg\+xml));base64,/)
+          if (mimeTypeMatch) {
+            const ext = mimeTypeMatch[2] === "svg+xml" ? "svg" : mimeTypeMatch[2]
+            const thumbName = `thumbnail.${ext}`
+            const base64Data = thumbnail.split(',')[1]
+            const binaryData = atob(base64Data)
+            const arrayBuffer = new ArrayBuffer(binaryData.length)
+            const uint8Array = new Uint8Array(arrayBuffer)
+            for (let i = 0; i < binaryData.length; i++) {
+              uint8Array[i] = binaryData.charCodeAt(i)
+            }
+            zip.file(thumbName, uint8Array)
           }
-          
-          zip.file(thumbnailFileName, uint8Array) // Add thumbnail to root of AASX
         }
         
         // Add aasx-origin file (required for AASX structure)
@@ -2737,6 +3262,173 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     return cardinality === "ZeroToOne" || cardinality === "ZeroToMany"
   }
 
+  // All available element types for the add dialog
+  const ALL_ELEMENT_TYPES: { value: SubmodelElementModelType; label: string; description: string }[] = [
+    { value: "Property", label: "Property", description: "A single value with a data type" },
+    { value: "MultiLanguageProperty", label: "Multi-Language Property", description: "A value in multiple languages" },
+    { value: "SubmodelElementCollection", label: "Collection (SMC)", description: "A container for child elements" },
+    { value: "SubmodelElementList", label: "List (SML)", description: "An ordered list of elements" },
+    { value: "File", label: "File", description: "A reference to a file" },
+    { value: "Blob", label: "Blob", description: "Binary data stored inline" },
+    { value: "Range", label: "Range", description: "A value range with min and max" },
+    { value: "ReferenceElement", label: "Reference Element", description: "A reference to another element" },
+    { value: "Entity", label: "Entity", description: "An entity with optional asset ID" },
+    { value: "Capability", label: "Capability", description: "A capability of the asset" },
+    { value: "Operation", label: "Operation", description: "An operation with inputs/outputs" },
+    { value: "BasicEventElement", label: "Basic Event Element", description: "An event element" },
+    { value: "RelationshipElement", label: "Relationship Element", description: "A relationship between two elements" },
+    { value: "AnnotatedRelationshipElement", label: "Annotated Relationship", description: "A relationship with annotations" },
+  ];
+
+  // Open add element dialog
+  const openAddElementDialog = (parentPath: string[] | null = null) => {
+    setAddElementParentPath(parentPath);
+    setNewElementType("Property");
+    setNewElementIdShort("");
+    setNewElementCardinality("ZeroToOne");
+    setNewElementDescription("");
+    setNewElementSemanticId("");
+    setNewElementValueType("xs:string");
+    setNewElementEntityType("CoManagedEntity");
+    setShowAddElementDialog(true);
+  };
+
+  // Create a new element based on type
+  const createNewElement = (): SubmodelElement => {
+    const base: SubmodelElement = {
+      idShort: newElementIdShort.trim(),
+      modelType: newElementType,
+      cardinality: newElementCardinality,
+      description: newElementDescription.trim() || undefined,
+      semanticId: newElementSemanticId.trim() || undefined,
+    };
+
+    switch (newElementType) {
+      case "Property":
+        return { ...base, valueType: newElementValueType, value: "" };
+      case "MultiLanguageProperty":
+        return { ...base, value: { en: "" } };
+      case "SubmodelElementCollection":
+      case "SubmodelElementList":
+        return { ...base, children: [] };
+      case "File":
+        return { ...base, value: "", contentType: "" };
+      case "Blob":
+        return { ...base, value: "", contentType: "application/octet-stream" };
+      case "Range":
+        return { ...base, valueType: newElementValueType, min: "", max: "" };
+      case "ReferenceElement":
+        return { ...base, value: { type: "ModelReference", keys: [] } };
+      case "Entity":
+        return { ...base, entityType: newElementEntityType, children: [] };
+      case "Capability":
+        return { ...base };
+      case "Operation":
+        return { ...base, inputVariables: [], outputVariables: [], inoutputVariables: [] } as any;
+      case "BasicEventElement":
+        return { ...base, observed: { type: "ModelReference", keys: [] } } as any;
+      case "RelationshipElement":
+      case "AnnotatedRelationshipElement":
+        return { ...base, first: { type: "ModelReference", keys: [] }, second: { type: "ModelReference", keys: [] } };
+      default:
+        return base;
+    }
+  };
+
+  // Add element to the submodel data
+  const addElement = () => {
+    if (!selectedSubmodel || !newElementIdShort.trim()) {
+      toast.error("Please enter a valid idShort");
+      return;
+    }
+
+    // Validate idShort format
+    const idShortRegex = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
+    if (!idShortRegex.test(newElementIdShort.trim())) {
+      toast.error("idShort must start with a letter and contain only letters, digits, underscores, or hyphens");
+      return;
+    }
+
+    const submodelId = selectedSubmodel.idShort;
+    const newElement = createNewElement();
+
+    setSubmodelData((prev) => {
+      const newData = { ...prev };
+
+      if (addElementParentPath === null || addElementParentPath.length === 0) {
+        // Add at root level of the submodel
+        const existingElements = newData[submodelId] || [];
+        // Check for duplicate idShort
+        if (existingElements.some(el => el.idShort === newElement.idShort)) {
+          toast.error(`An element with idShort "${newElement.idShort}" already exists at this level`);
+          return prev;
+        }
+        newData[submodelId] = [...existingElements, newElement];
+      } else {
+        // Add as child of a collection
+        const addToElements = (elements: SubmodelElement[], path: string[]): SubmodelElement[] => {
+          if (path.length === 0) {
+            // Check for duplicate
+            if (elements.some(el => el.idShort === newElement.idShort)) {
+              toast.error(`An element with idShort "${newElement.idShort}" already exists at this level`);
+              return elements;
+            }
+            return [...elements, newElement];
+          }
+
+          const [current, ...rest] = path;
+          return elements.map(el => {
+            if (el.idShort === current) {
+              const children = el.children || [];
+              if (rest.length === 0) {
+                // Check for duplicate at target level
+                if (children.some(c => c.idShort === newElement.idShort)) {
+                  toast.error(`An element with idShort "${newElement.idShort}" already exists at this level`);
+                  return el;
+                }
+                return { ...el, children: [...children, newElement] };
+              }
+              return { ...el, children: addToElements(children, rest) };
+            }
+            return el;
+          });
+        };
+
+        newData[submodelId] = addToElements(newData[submodelId] || [], addElementParentPath);
+      }
+
+      return newData;
+    });
+
+    // Expand the parent if needed
+    if (addElementParentPath && addElementParentPath.length > 0) {
+      const nodeId = addElementParentPath.join('.');
+      setExpandedNodes(prev => new Set([...prev, nodeId]));
+    }
+
+    toast.success(`Added ${newElementType} "${newElementIdShort}"`);
+    setShowAddElementDialog(false);
+
+    // Select the new element
+    setTimeout(() => {
+      const path = addElementParentPath ? [...addElementParentPath, newElementIdShort] : [newElementIdShort];
+      const elements = submodelData[submodelId] || [];
+      const findByPath = (els: SubmodelElement[], p: string[], idx = 0): SubmodelElement | null => {
+        if (idx >= p.length) return null;
+        const cur = els.find(e => e.idShort === p[idx]);
+        if (!cur) return null;
+        if (idx === p.length - 1) return cur;
+        return cur.children ? findByPath(cur.children, p, idx + 1) : null;
+      };
+      // Use the updated data
+      setSubmodelData(current => {
+        const found = findByPath(current[submodelId] || [], path);
+        if (found) setSelectedElement(found);
+        return current;
+      });
+    }, 100);
+  };
+
   const handleThumbnailUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (file && file.type.startsWith('image/')) {
@@ -2856,9 +3548,89 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     return null
   }
 
+  // NEW: Convert string errors to ValidationAlert format
+  const convertToValidationAlerts = useCallback((
+    internalErrors: string[],
+    xmlErrors: any[],
+    jsonErrors: any[]
+  ): ValidationAlert[] => {
+    const alerts: ValidationAlert[] = [];
+
+    // Convert internal (required field) errors - these are blocking
+    internalErrors.forEach(err => {
+      const parts = err.split('>').map(p => p.trim()).filter(Boolean);
+      const path = parts.length > 1 ? parts.join(' > ') : err;
+      const fieldName = parts[parts.length - 1] || err;
+
+      alerts.push({
+        fieldName,
+        path,
+        description: `Missing required field: ${fieldName}`,
+        type: AlertType.ERROR,
+        hint: "This field is required for a valid AAS model",
+        fixable: true,
+        code: "REQUIRED_FIELD"
+      });
+    });
+
+    // Convert XML schema errors
+    xmlErrors.forEach((err: any) => {
+      const text = typeof err === "string" ? err : (err?.message || String(err));
+      const line = typeof err === "object" ? (err?.loc?.lineNumber ?? undefined) : undefined;
+
+      // Determine if this is fixable based on the error type
+      const isFixable = /empty|minlength|displayname|description|embeddeddataspecifications|definition|valuereferencepairs|keys/i.test(text);
+
+      // Determine severity - some XML errors are warnings (can proceed with fixes)
+      const isWarning = /embeddeddataspecifications|displayname|shortname/i.test(text);
+
+      alerts.push({
+        fieldName: getFieldFromMessage(text) || "XML Schema",
+        path: line && lastGeneratedXml ? resolvePathFromLine(lastGeneratedXml, line) || undefined : undefined,
+        description: text,
+        type: isWarning ? AlertType.WARNING : AlertType.ERROR,
+        hint: getHintForError(text),
+        line,
+        fixable: isFixable,
+        code: "XML_SCHEMA"
+      });
+    });
+
+    // Convert JSON validation errors
+    jsonErrors.forEach((err: any) => {
+      const text = typeof err === "string" ? err : (err?.message || err?.path ? `${err.path}: ${err.message}` : String(err));
+
+      alerts.push({
+        fieldName: err?.path?.split('/')?.pop() || "JSON Structure",
+        path: err?.path,
+        description: text,
+        type: AlertType.WARNING,
+        hint: "Check your JSON structure matches AAS specification",
+        fixable: false,
+        code: "JSON_STRUCTURE"
+      });
+    });
+
+    return alerts;
+  }, [lastGeneratedXml]);
+
+  // Helper to get hint for common errors
+  const getHintForError = (text: string): string | undefined => {
+    const lower = text.toLowerCase();
+    if (lower.includes("minlength") && lower.includes("value")) return "Provide a non-empty value or remove the empty element.";
+    if (lower.includes("displayname")) return "Add a language-tagged displayName entry (e.g., with language=en).";
+    if (lower.includes("description")) return "Descriptions must include langStringTextType with language and text.";
+    if (lower.includes("embeddeddataspecifications")) return "If present, must contain at least one embeddedDataSpecification.";
+    if (lower.includes("definition")) return "Definition must include langStringDefinitionTypeIec61360 with language and text.";
+    if (lower.includes("keys")) return "Keys must contain at least one key element.";
+    if (lower.includes("semanticid")) return "Use ExternalReference with keys containing the semantic ID value.";
+    return undefined;
+  };
+
   // ADD: manual validate action (internal)
   const runInternalValidation = async (overrideXml?: string, options?: { openDialog?: boolean }) => {
     if (validationRunningRef.current) return;
+
     validationRunningRef.current = true;
     setValidationBusy(true);
     try {
@@ -2870,13 +3642,20 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       const env = buildJsonEnvironment();
       const jsonResult = await validateAASXJson(JSON.stringify(env));
 
-      // Prefer original uploaded XML if available
+      // Prefer override XML (from fix) if available
       const xmlBuilt =
         (overrideXml && overrideXml.trim().length > 0)
           ? overrideXml
           : (originalXml && originalXml.trim().length > 0)
             ? originalXml
             : buildCurrentXml();
+
+      // Debug: log which XML source is being used and namespace info
+      const xmlSource = overrideXml ? "overrideXml (from fix)" : originalXml ? "originalXml state" : "buildCurrentXml()";
+      console.log(`[v0] Validating XML from: ${xmlSource}`);
+      console.log(`[v0] XML has 3.0 namespace: ${xmlBuilt.includes("admin-shell.io/aas/3/0")}`);
+      console.log(`[v0] XML has 3.1 namespace: ${xmlBuilt.includes("admin-shell.io/aas/3/1")}`);
+
       setLastGeneratedXml(xmlBuilt);
       const xmlResult = await validateAASXXml(xmlBuilt);
 
@@ -2893,6 +3672,11 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       const xmlErrCount = Array.isArray(rawErrors) ? rawErrors.length : xmlErrorsNormalized.length;
       const internalCount = internal.missingFields.length;
 
+      // NEW: Build ValidationAlerts from all error sources
+      const jsonErrs = !jsonResult.valid && (jsonResult as any).errors ? (jsonResult as any).errors : [];
+      const alerts = convertToValidationAlerts(internal.missingFields, rawErrors, jsonErrs);
+      setValidationAlerts(alerts);
+
       // Detect service outage and notify via toast
       const serviceDown = Array.isArray(rawErrors) && rawErrors.some((e: any) => {
         const msg = typeof e === "string" ? e : (e?.message || "");
@@ -2905,8 +3689,9 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       const allGood = internalCount === 0 && jsonResult.valid && (serviceDown ? true : xmlResult.valid);
 
       // Open validation result popup (respect options and dismissal)
-      const wantOpen = options?.openDialog ?? validationDialogOpen;
-      const shouldOpen = wantOpen && !validationDialogDismissed;
+      // Don't auto-open dialog when creating a new AAS (only show inline errors in middle panel)
+      const wantOpen = options?.openDialog ?? true;
+      const shouldOpen = sourceXml ? wantOpen : false;
       setValidationDialogOpen(shouldOpen);
 
       setValidationCounts({ internal: internalCount, json: jsonErrCount, xml: xmlErrCount });
@@ -3184,9 +3969,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
 
     // 2) Try friendly XML errors if available and they provide a path
     try {
-      const source = xmlErrorsRaw.length ? xmlErrorsRaw : externalIssues;
-      const friendly = buildFriendlyXmlErrors(source as any);
-      const withPath = Array.isArray(friendly) ? friendly.find((fe: any) => fe?.path) : null;
+      const withPath = memoizedFriendlyXmlErrors.find((fe: any) => fe?.path);
       if (withPath?.path) return withPath.path as string;
     } catch {
       // ignore
@@ -3267,13 +4050,27 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         hint = "Ensure valueType appears before value for Property / MultiLanguageProperty.";
       } else if (lower.includes("contenttype") && lower.includes("file")) {
         hint = "File elements must include contentType and a valid value (path or URL).";
+      } else if (lower.includes("semanticid") && (lower.includes("not expected") || lower.includes("value/valueid"))) {
+        hint = "semanticId is not allowed here. In ReferenceElement, use value and valueId instead.";
       } else if (lower.includes("semanticid")) {
         hint = "Use ExternalReference with keys → GlobalReference → value containing the semantic ID.";
+      } else if (lower.includes("globalassetid") && lower.includes("keys")) {
+        hint = "globalAssetId should be a simple string value, not a reference with keys.";
+      } else if (lower.includes("key") && (lower.includes("type attribute") || lower.includes("value attribute") || lower.includes("attribute 'type'") || lower.includes("attribute 'value'"))) {
+        hint = "key elements must have type and value as child elements, not as attributes.";
+      } else if (lower.includes("embeddeddataspecifications") && lower.includes("not expected")) {
+        hint = "embeddedDataSpecifications is not allowed in this element type.";
       }
 
       return { message: msg, hint, path, field, displayField, line };
     });
   }
+
+  // PERF: Memoize the friendly XML errors to avoid recomputing on every render
+  const memoizedFriendlyXmlErrors = useMemo(() => {
+    const source = xmlErrorsRaw.length ? xmlErrorsRaw : externalIssues;
+    return buildFriendlyXmlErrors(source as any);
+  }, [xmlErrorsRaw, externalIssues, lastGeneratedXml]);
 
   // NEW: guess a model path from an XML line by scanning for nearby idShorts
   function guessPathFromXmlLine(xml: string, lineNumber: number): string | null {
@@ -3352,6 +4149,9 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     if (lower.includes("embeddeddataspecifications")) return "embeddedDataSpecifications";
     if (lower.includes("{https://admin-shell.io/aas/3/1}definition") || lower.includes("langstringdefinitiontypeiec61360")) return "definition";
     if (lower.includes("{https://admin-shell.io/aas/3/1}valuereferencepairs") || lower.includes("valuereferencepair")) return "valueReferencePairs";
+    if (lower.includes("globalassetid")) return "globalAssetId";
+    if (lower.includes("semanticid")) return "semanticId";
+    if (lower.includes("{https://admin-shell.io/aas/3/1}key") || (lower.includes("key") && (lower.includes("type") || lower.includes("value")))) return "key";
     return undefined;
   }
 
@@ -3496,11 +4296,33 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
 
   // NEW: Auto-fix XML errors in original XML (or current XML preview) by adding/removing minimal content to satisfy schema
   function fixXmlErrors(): string | null {
+    console.log("[v0] fixXmlErrors() called");
+
     // Use original uploaded XML if present; else fall back to latest built XML
-    const xml =
+    let xml =
       (originalXml && originalXml.trim()) ||
       (lastGeneratedXml && lastGeneratedXml.trim()) ||
       buildCurrentXml();
+
+    console.log(`[v0] Starting XML length: ${xml.length}, source: ${originalXml ? "originalXml" : lastGeneratedXml ? "lastGeneratedXml" : "buildCurrentXml()"}`);
+
+    // Pass 0: Upgrade namespace from 3.0 to 3.1 if needed
+    // Handle various namespace declaration patterns
+    const ns30Patterns = [
+      /https:\/\/admin-shell\.io\/aas\/3\/0/gi,  // Full URL
+      /admin-shell\.io\/aas\/3\/0/gi,  // Without https
+    ];
+    let namespaceUpgraded = false;
+    ns30Patterns.forEach(pattern => {
+      if (pattern.test(xml)) {
+        xml = xml.replace(pattern, (match) => match.replace(/3\/0/, "3/1"));
+        namespaceUpgraded = true;
+      }
+    });
+    if (namespaceUpgraded) {
+      console.log("[v0] Upgraded namespace from 3.0 to 3.1");
+      console.log("[v0] XML namespace check after upgrade:", xml.includes("admin-shell.io/aas/3/0") ? "still has 3.0!" : "successfully upgraded to 3.1");
+    }
 
     const doc = new DOMParser().parseFromString(xml, "application/xml");
     const parserError = doc.querySelector("parsererror");
@@ -3509,8 +4331,23 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       return null;
     }
 
-    const ns = doc.documentElement.namespaceURI || "https://admin-shell.io/aas/3/1";
+    const ns = doc.documentElement.namespaceURI || ns31;
     const create = (local: string) => doc.createElementNS(ns, local);
+
+    // Helper: get all elements by local name (works with namespaced XML)
+    const getByLocalName = (localName: string): Element[] => {
+      // Try both namespaced and non-namespaced queries
+      const byNS = Array.from(doc.getElementsByTagNameNS(ns, localName));
+      const byTag = Array.from(doc.getElementsByTagName(localName));
+      // Also query all elements and filter by localName
+      const all = Array.from(doc.querySelectorAll("*")).filter(el => el.localName === localName);
+      // Combine and dedupe
+      const set = new Set([...byNS, ...byTag, ...all]);
+      return Array.from(set);
+    };
+
+    // Track fixes applied
+    let fixCount = 0;
 
     // Helper: find nearest idShort text for a friendly default
     const findNearestIdShort = (el: Element): string | null => {
@@ -3983,7 +4820,247 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       }
     });
 
-    const fixed = new XMLSerializer().serializeToString(doc);
+    // Pass 15: Remove empty qualifiers containers (must contain at least one qualifier if present)
+    // Use querySelectorAll with local-name check for better namespace handling
+    const qualifiersToRemove: Element[] = [];
+    let qualifiersFound = 0;
+    doc.querySelectorAll("*").forEach((el) => {
+      if (el.localName === "qualifiers") {
+        qualifiersFound++;
+        const children = Array.from(el.children);
+        const hasQualifier = children.some((c) => c.localName === "qualifier");
+        console.log(`[v0] Pass 15: Found qualifiers element #${qualifiersFound}, children=${children.length}, hasQualifier=${hasQualifier}`);
+        if (children.length > 0) {
+          console.log(`[v0] Pass 15: qualifiers children localNames:`, children.map(c => c.localName).join(", "));
+        }
+        if (!hasQualifier) {
+          qualifiersToRemove.push(el);
+        }
+      }
+    });
+    console.log(`[v0] Pass 15: Found ${qualifiersFound} qualifiers elements, ${qualifiersToRemove.length} to remove`);
+    qualifiersToRemove.forEach((el, idx) => {
+      console.log(`[v0] Removing empty qualifiers element #${idx + 1}, parent=${el.parentElement?.localName}`);
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    // Pass 16: Remove empty statements containers (Entity element - must contain allowed elements if present)
+    const statementsToRemove: Element[] = [];
+    const allowedStatementChildren = new Set([
+      "relationshipElement", "annotatedRelationshipElement", "basicEventElement",
+      "blob", "capability", "entity", "file", "multiLanguageProperty",
+      "operation", "property", "range", "referenceElement",
+      "submodelElementCollection", "submodelElementList"
+    ]);
+    doc.querySelectorAll("*").forEach((el) => {
+      if (el.localName === "statements") {
+        const hasAllowed = Array.from(el.children).some((c) => allowedStatementChildren.has(c.localName));
+        if (!hasAllowed) {
+          statementsToRemove.push(el);
+        }
+      }
+    });
+    statementsToRemove.forEach((el) => {
+      console.log("[v0] Removing empty statements element");
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    // Pass 17: Fix value elements in SubmodelElementCollection/SubmodelElementList
+    // These should contain child elements, not text content
+    const collectionParentTags = new Set(["submodelElementCollection", "submodelElementList"]);
+    const allowedValueChildren = new Set([
+      "relationshipElement", "annotatedRelationshipElement", "basicEventElement",
+      "blob", "capability", "entity", "file", "multiLanguageProperty",
+      "operation", "property", "range", "referenceElement",
+      "submodelElementCollection", "submodelElementList"
+    ]);
+    const valuesToRemove: Element[] = [];
+    doc.querySelectorAll("*").forEach((parent) => {
+      if (collectionParentTags.has(parent.localName)) {
+        Array.from(parent.children).forEach((child) => {
+          if (child.localName === "value") {
+            const hasAllowedChild = Array.from(child.children).some((c) => allowedValueChildren.has(c.localName));
+            const hasTextContent = (child.textContent || "").trim().length > 0 && child.children.length === 0;
+
+            if (hasTextContent && !hasAllowedChild) {
+              // This value has text content but should have element children - clear it
+              console.log("[v0] Clearing text content from collection value element");
+              child.textContent = "";
+              fixCount++;
+            }
+
+            // If value is empty (no children, no meaningful content), mark for removal
+            if (child.children.length === 0 && (child.textContent || "").trim().length === 0) {
+              valuesToRemove.push(child);
+            }
+          }
+        });
+      }
+    });
+    valuesToRemove.forEach((el) => {
+      console.log("[v0] Removing empty value element from collection");
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    // Pass 18: Remove empty extensions containers
+    const extensionsToRemove: Element[] = [];
+    doc.querySelectorAll("*").forEach((el) => {
+      if (el.localName === "extensions") {
+        const hasExtension = Array.from(el.children).some((c) => c.localName === "extension");
+        if (!hasExtension) {
+          extensionsToRemove.push(el);
+        }
+      }
+    });
+    extensionsToRemove.forEach((el) => {
+      console.log("[v0] Removing empty extensions element");
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    // Pass 19: Remove empty supplementalSemanticIds containers
+    const supplementalToRemove: Element[] = [];
+    doc.querySelectorAll("*").forEach((el) => {
+      if (el.localName === "supplementalSemanticIds") {
+        const hasRef = Array.from(el.children).some((c) => c.localName === "reference");
+        if (!hasRef) {
+          supplementalToRemove.push(el);
+        }
+      }
+    });
+    supplementalToRemove.forEach((el) => {
+      console.log("[v0] Removing empty supplementalSemanticIds element");
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    // Pass 20: Second pass to catch any remaining empty containers
+    const emptyContainersToRemove: Element[] = [];
+    const emptyContainerNames = new Set(["qualifiers", "statements", "extensions", "supplementalSemanticIds"]);
+    doc.querySelectorAll("*").forEach((el) => {
+      if (emptyContainerNames.has(el.localName) && el.children.length === 0) {
+        emptyContainersToRemove.push(el);
+      }
+    });
+    emptyContainersToRemove.forEach((el) => {
+      console.log(`[v0] Removing remaining empty ${el.localName} element`);
+      el.parentElement?.removeChild(el);
+      fixCount++;
+    });
+
+    let fixed = new XMLSerializer().serializeToString(doc);
+
+    // DEBUG: Log what qualifiers elements look like in the serialized XML
+    const qualifiersMatches = fixed.match(/<[^>]*qualifiers[^>]*>[\s\S]*?<\/[^>]*qualifiers>/gi) || [];
+    console.log(`[v0] Found ${qualifiersMatches.length} qualifiers elements in serialized XML`);
+    if (qualifiersMatches.length > 0) {
+      console.log("[v0] Sample qualifiers element:", qualifiersMatches[0]);
+    }
+
+    // Post-processing: Use string-based regex to remove empty containers that DOM manipulation missed
+    // This is more reliable for namespaced XML
+    const emptyContainerPatterns = [
+      // Empty qualifiers with any whitespace inside (handles namespace prefixes like aas:qualifiers)
+      /<([a-zA-Z0-9_-]+:)?qualifiers[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?qualifiers>/gi,
+      /<([a-zA-Z0-9_-]+:)?qualifiers\s*\/>/gi,
+      // Empty statements with any whitespace inside
+      /<([a-zA-Z0-9_-]+:)?statements[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?statements>/gi,
+      /<([a-zA-Z0-9_-]+:)?statements\s*\/>/gi,
+      // Empty extensions
+      /<([a-zA-Z0-9_-]+:)?extensions[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?extensions>/gi,
+      /<([a-zA-Z0-9_-]+:)?extensions\s*\/>/gi,
+      // Empty supplementalSemanticIds
+      /<([a-zA-Z0-9_-]+:)?supplementalSemanticIds[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?supplementalSemanticIds>/gi,
+      /<([a-zA-Z0-9_-]+:)?supplementalSemanticIds\s*\/>/gi,
+      // Empty value elements (only whitespace content)
+      /<([a-zA-Z0-9_-]+:)?value[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?value>/gi,
+      /<([a-zA-Z0-9_-]+:)?value\s*\/>/gi,
+    ];
+
+    // DEBUG: Test if our pattern would match the sample element
+    if (qualifiersMatches.length > 0) {
+      const testPattern = /<([a-zA-Z0-9_-]+:)?qualifiers[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?qualifiers>/gi;
+      const wouldMatch = testPattern.test(qualifiersMatches[0]);
+      console.log(`[v0] Test pattern matches sample: ${wouldMatch}`);
+      if (!wouldMatch) {
+        // Try to understand what's inside the qualifiers
+        const innerContent = qualifiersMatches[0].replace(/<[^>]*qualifiers[^>]*>/gi, '').replace(/<\/[^>]*qualifiers>/gi, '');
+        console.log(`[v0] Inner content of qualifiers (length=${innerContent.length}):`, JSON.stringify(innerContent.substring(0, 200)));
+      }
+    }
+
+    let prevLength = fixed.length;
+    let iterations = 0;
+    const maxIterations = 10;
+
+    // Keep removing until no more changes (handles nested empties)
+    do {
+      prevLength = fixed.length;
+      emptyContainerPatterns.forEach((pattern, idx) => {
+        const before = fixed.length;
+        fixed = fixed.replace(pattern, '');
+        if (fixed.length < before) {
+          const removed = (before - fixed.length);
+          console.log(`[v0] String cleanup: removed ${removed} chars with pattern[${idx}]: ${pattern}`);
+          fixCount++;
+        }
+      });
+      iterations++;
+    } while (fixed.length < prevLength && iterations < maxIterations);
+
+    // Also remove SubmodelElementList/Collection value elements that only contain text (not elements)
+    // BUT preserve <value> elements inside <key> elements (they contain semanticId values)
+    // Pattern: <value>anything that's not a tag</value> (with optional namespace prefix)
+    const valueTextPattern = /<([a-zA-Z0-9_-]+:)?value>([^<]+)<\/([a-zA-Z0-9_-]+:)?value>/g;
+    fixed = fixed.replace(valueTextPattern, (match, prefix1, content, prefix2, offset) => {
+      // Only remove if the content is just text (no child elements)
+      if (content.trim() && !content.includes('<')) {
+        // Check if this <value> is inside a <key> element by looking at preceding text
+        // Key elements have structure: <key><type>...</type><value>...</value></key>
+        const precedingText = fixed.substring(Math.max(0, offset - 200), offset);
+
+        // If preceded by </type> without a closing </key> after it, this value is inside a key
+        const lastTypeClose = precedingText.lastIndexOf('</type>');
+        const lastKeyClose = precedingText.lastIndexOf('</key>');
+        const lastKeyOpen = precedingText.lastIndexOf('<key>');
+
+        // Also check for namespaced versions
+        const lastTypeClosed = Math.max(
+          precedingText.lastIndexOf('</type>'),
+          precedingText.lastIndexOf(':type>')
+        );
+        const lastKeyClosed = Math.max(
+          precedingText.lastIndexOf('</key>'),
+          precedingText.lastIndexOf(':key>')
+        );
+        const lastKeyOpened = Math.max(
+          precedingText.lastIndexOf('<key>'),
+          precedingText.lastIndexOf(':key>')
+        );
+
+        // If we're inside a <key> element (opened more recently than closed, and type just closed)
+        if (lastTypeClose > lastKeyClose && lastKeyOpen > lastKeyClose) {
+          // This is a valid <value> inside a <key> - preserve it
+          console.log(`[v0] Preserving value inside key: "${content.substring(0, 50)}..."`);
+          return match;
+        }
+
+        // Also preserve if content looks like a semanticId (IRDI, IRI patterns)
+        if (content.includes('0173-1#') || content.includes('0112/') || content.includes('http') || content.includes('urn:')) {
+          console.log(`[v0] Preserving value with semanticId pattern: "${content.substring(0, 50)}..."`);
+          return match;
+        }
+
+        console.log(`[v0] Removing value with text-only content: "${content.substring(0, 50)}..."`);
+        fixCount++;
+        return ''; // Remove the entire value element
+      }
+      return match;
+    });
+
     const withHeader = fixed.startsWith("<?xml") ? fixed : `<?xml version="1.0" encoding="UTF-8"?>\n${fixed}`;
 
     // Update editor state to use the fixed XML for next validation/export
@@ -3993,7 +5070,15 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     // NEW: also fix model.json in attachments
     fixJsonEnvironment();
 
-    toast.success("Applied fixes. Click Validate to re-check.");
+    console.log(`[v0] Applied ${fixCount} fixes to XML`);
+    console.log(`[v0] Fixed XML has 3.0 namespace: ${withHeader.includes("admin-shell.io/aas/3/0")}`);
+    console.log(`[v0] Fixed XML has 3.1 namespace: ${withHeader.includes("admin-shell.io/aas/3/1")}`);
+    console.log(`[v0] Fixed XML length: ${withHeader.length}`);
+    // Count both prefixed and non-prefixed tags
+    console.log(`[v0] Remaining qualifiers tags: ${(withHeader.match(/<([a-zA-Z0-9_-]+:)?qualifiers/g) || []).length}`);
+    console.log(`[v0] Remaining statements tags: ${(withHeader.match(/<([a-zA-Z0-9_-]+:)?statements/g) || []).length}`);
+    console.log(`[v0] Remaining empty value tags: ${(withHeader.match(/<([a-zA-Z0-9_-]+:)?value[^>]*>\s*<\/([a-zA-Z0-9_-]+:)?value>/g) || []).length}`);
+    toast.success(`Applied ${fixCount} fixes. Validating...`);
     return withHeader;
   }
 
@@ -4144,149 +5229,231 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
   };
 
   return (
-    <div className="h-full flex flex-col bg-white dark:bg-gray-900">
-      {/* Header */}
-      <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-        <div className="flex items-start justify-between gap-6">
+    <div className="h-full flex flex-col bg-gray-50 dark:bg-gray-900">
+      {/* Beautiful Gradient Header */}
+      <div className="relative bg-gradient-to-br from-[#61caf3] via-[#4db6e6] to-[#3a9fd4] px-6 py-5">
+        <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxwYXRoIGQ9Ik0zNiAxOGMtOS45NDEgMC0xOCA4LjA1OS0xOCAxOHM4LjA1OSAxOCAxOCAxOCAxOC04LjA1OSAxOC0xOC04LjA1OS0xOC0xOC0xOHptMCAzMmMtNy43MzIgMC0xNC02LjI2OC0xNC0xNHM2LjI2OC0xNCAxNC0xNCAxNCA2LjI2OCAxNCAxNC02LjI2OCAxNC0xNCAxNHoiIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iLjA1Ii8+PC9nPjwvc3ZnPg==')] opacity-30" />
+        <div className="relative z-10 flex items-start justify-between gap-6">
           <div className="flex-1">
             <div className="flex items-center gap-4">
               <button
-                onClick={onBack}
-                className="p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
-                title="Back to Home"
+                onClick={() => confirmNavigation(onBack)}
+                className="p-2.5 bg-white/20 hover:bg-white/30 backdrop-blur-sm rounded-xl transition-all"
+                title={hasUnsavedChanges ? "Back to Home (unsaved changes)" : "Back to Home"}
               >
-                <ArrowLeft className="w-5 h-5" />
+                <ArrowLeft className="w-5 h-5 text-white" />
               </button>
               <div>
-                <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
-                  Edit AAS: {aasConfig.idShort}
-                </h2>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
+                <div className="flex items-center gap-3 mb-1">
+                  <div className="p-2 bg-white/20 backdrop-blur-sm rounded-xl">
+                    <Sparkles className="w-5 h-5 text-white" />
+                  </div>
+                  <h2 className="text-xl font-bold text-white tracking-tight">
+                    Edit AAS: {aasConfig.idShort}
+                  </h2>
+                </div>
+                <p className="text-white/80 pl-12 text-sm">
                   Fill in the values for your Asset Administration Shell
-                  <span className="ml-2 text-red-600">* = Required field</span>
+                  <span className="ml-2 px-2 py-0.5 bg-red-500/20 text-red-100 rounded text-xs">* = Required</span>
                 </p>
               </div>
             </div>
-            {/* AAS Info inline grid */}
-            <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {/* AAS Info inline grid - glassmorphism cards */}
+            <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               {/* IdShort */}
-              <div className="space-y-1">
-                <div className="text-[11px] font-medium text-gray-600 dark:text-gray-400">IdShort</div>
+              <div className="bg-white/10 backdrop-blur-sm rounded-xl p-3 border border-white/20">
+                <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">IdShort</div>
                 <div className="flex items-center gap-2">
-                  <Input
+                  <input
                     value={aasConfig.idShort || ""}
                     onChange={(e) => setAASFieldValue('idShort', e.target.value)}
-                    className="h-9"
+                    className={cn(
+                      "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
+                      editMode
+                        ? "bg-white text-gray-900 border-2 border-transparent focus:border-white/50 focus:outline-none"
+                        : "bg-white/20 text-white border border-white/20 cursor-not-allowed"
+                    )}
                     disabled={!editMode}
                   />
-                  <Button size="icon-sm" variant="ghost" onClick={() => copyText('IdShort', aasConfig.idShort)} title="Copy IdShort">
-                    <Copy className="size-4" />
-                  </Button>
+                  <button
+                    onClick={() => copyText('IdShort', aasConfig.idShort)}
+                    className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                    title="Copy IdShort"
+                  >
+                    <Copy className="w-4 h-4 text-white/70" />
+                  </button>
                 </div>
               </div>
               {/* ID */}
-              <div className="space-y-1">
-                <div className="text-[11px] font-medium text-gray-600 dark:text-gray-400">ID</div>
+              <div className="bg-white/10 backdrop-blur-sm rounded-xl p-3 border border-white/20">
+                <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">ID</div>
                 <div className="flex items-center gap-2">
-                  <Input
+                  <input
                     value={aasConfig.id || ""}
                     onChange={(e) => setAASFieldValue('id', e.target.value)}
-                    className="h-9"
+                    className={cn(
+                      "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
+                      editMode
+                        ? "bg-white text-gray-900 border-2 border-transparent focus:border-white/50 focus:outline-none"
+                        : "bg-white/20 text-white border border-white/20 cursor-not-allowed"
+                    )}
                     disabled={!editMode}
                   />
-                  <Button size="icon-sm" variant="ghost" onClick={() => copyText('ID', aasConfig.id)} title="Copy ID">
-                    <Copy className="size-4" />
-                  </Button>
+                  <button
+                    onClick={() => copyText('ID', aasConfig.id)}
+                    className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                    title="Copy ID"
+                  >
+                    <Copy className="w-4 h-4 text-white/70" />
+                  </button>
                 </div>
               </div>
               {/* Asset Kind */}
-              <div className="space-y-1">
-                <div className="text-[11px] font-medium text-gray-600 dark:text-gray-400">Asset Kind</div>
+              <div className="bg-white/10 backdrop-blur-sm rounded-xl p-3 border border-white/20">
+                <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">Asset Kind</div>
                 <div className="flex items-center gap-2">
-                  <Input
+                  <input
                     value={aasConfig.assetKind || ""}
                     onChange={(e) => setAASFieldValue('assetKind', e.target.value)}
-                    className="h-9"
+                    className={cn(
+                      "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
+                      editMode
+                        ? "bg-white text-gray-900 border-2 border-transparent focus:border-white/50 focus:outline-none"
+                        : "bg-white/20 text-white border border-white/20 cursor-not-allowed"
+                    )}
                     disabled={!editMode}
                   />
-                  <Button size="icon-sm" variant="ghost" onClick={() => copyText('Asset Kind', aasConfig.assetKind)} title="Copy Asset Kind">
-                    <Copy className="size-4" />
-                  </Button>
+                  <button
+                    onClick={() => copyText('Asset Kind', aasConfig.assetKind)}
+                    className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                    title="Copy Asset Kind"
+                  >
+                    <Copy className="w-4 h-4 text-white/70" />
+                  </button>
                 </div>
               </div>
               {/* Global Asset ID */}
-              <div className="space-y-1">
-                <div className="text-[11px] font-medium text-gray-600 dark:text-gray-400">Global Asset ID</div>
+              <div className="bg-white/10 backdrop-blur-sm rounded-xl p-3 border border-white/20">
+                <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">Global Asset ID</div>
                 <div className="flex items-center gap-2">
-                  <Input
+                  <input
                     value={aasConfig.globalAssetId || ""}
                     onChange={(e) => setAASFieldValue('globalAssetId', e.target.value)}
-                    className="h-9"
+                    className={cn(
+                      "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
+                      editMode
+                        ? "bg-white text-gray-900 border-2 border-transparent focus:border-white/50 focus:outline-none"
+                        : "bg-white/20 text-white border border-white/20 cursor-not-allowed"
+                    )}
                     disabled={!editMode}
                   />
-                  <Button size="icon-sm" variant="ghost" onClick={() => copyText('Global Asset ID', aasConfig.globalAssetId)} title="Copy Global Asset ID">
-                    <Copy className="size-4" />
-                  </Button>
+                  <button
+                    onClick={() => copyText('Global Asset ID', aasConfig.globalAssetId)}
+                    className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+                    title="Copy Global Asset ID"
+                  >
+                    <Copy className="w-4 h-4 text-white/70" />
+                  </button>
                 </div>
               </div>
             </div>
           </div>
           {/* Actions */}
-          <div className="flex flex-col items-end gap-2 shrink-0">
+          <div className="flex flex-col items-end gap-3 shrink-0">
+            {/* Status indicators row */}
             <div className="flex items-center gap-3">
-               <Button
+              {hasUnsavedChanges && (
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/20 text-amber-100 rounded-full text-xs font-medium">
+                        <Save className="w-3 h-3" />
+                        Unsaved
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>You have unsaved changes</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              )}
+              {hasValidated && validationAlerts.length === 0 && (
+                <span className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-500/20 text-emerald-100 rounded-full text-xs font-medium">
+                  <CheckCircle className="w-3 h-3" />
+                  Valid
+                </span>
+              )}
+              {hasValidated && validationAlerts.length > 0 && (
+                <span className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/20 text-red-100 rounded-full text-xs font-medium">
+                  <AlertCircle className="w-3 h-3" />
+                  {validationAlerts.length} issues
+                </span>
+              )}
+              {validationBusy && (
+                <span className="flex items-center gap-1.5 px-3 py-1.5 bg-white/20 text-white rounded-full text-xs font-medium">
+                  <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Validating...
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+               <button
                  onClick={() => setEditMode((v) => !v)}
-                 size="lg"
-                 variant="default"
-                 className={(editMode ? "bg-emerald-600 hover:bg-emerald-700" : "bg-[#61caf3] hover:bg-[#4db6e6]") + " text-white shadow-md"}
+                 className={cn(
+                   "px-5 py-2.5 rounded-xl font-semibold text-sm transition-all duration-200 shadow-lg",
+                   editMode
+                     ? "bg-white text-emerald-600 hover:bg-emerald-50"
+                     : "bg-white/20 text-white hover:bg-white/30 backdrop-blur-sm border border-white/30"
+                 )}
                >
-                 {editMode ? "Done" : "Edit"}
-               </Button>
-               <Button
+                 {editMode ? "Done Editing" : "Edit Mode"}
+               </button>
+               <button
                  onClick={() => {
                    setValidationDialogDismissed(false);
                    runInternalValidation(undefined, { openDialog: true });
                  }}
-                 size="lg"
-                 variant="default"
-                 className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md"
+                 disabled={validationBusy}
+                 className="px-5 py-2.5 rounded-xl font-semibold text-sm bg-white text-[#3a9fd4] hover:bg-white/90 shadow-lg transition-all duration-200 disabled:opacity-50"
                >
-                 Validate
-               </Button>
-               <Button
+                 {validationBusy ? "Validating..." : "Validate"}
+               </button>
+               <button
                 onClick={openPdfDialog}
-                size="lg"
-                variant="outline"
-                className="bg-white dark:bg-gray-900 border-gray-300 text-gray-800 hover:bg-gray-50 dark:text-gray-200 shadow-sm"
                 disabled={downloadingPdfs}
+                className="px-5 py-2.5 rounded-xl font-semibold text-sm bg-white/20 text-white hover:bg-white/30 backdrop-blur-sm border border-white/30 shadow-lg transition-all duration-200 disabled:opacity-50 flex items-center gap-2"
                 title="Download all PDFs in this model"
               >
                 {downloadingPdfs ? (
                   <>
-                    <div className="w-5 h-5 border-2 border-gray-600 dark:border-gray-300 border-t-transparent rounded-full animate-spin" />
-                    <span className="ml-2">Preparing PDFs...</span>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    Preparing...
                   </>
                 ) : (
                   <>
-                    <FileDown className="w-5 h-5" />
-                    <span className="ml-2">Download PDFs</span>
+                    <FileDown className="w-4 h-4" />
+                    PDFs
                   </>
                 )}
-              </Button>
-               {/* REMOVED: Save button per latest requirement */}
+              </button>
                <button
                  onClick={generateFinalAAS}
                  disabled={isGenerating || !canGenerate}
-                 className="flex items-center gap-2 px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                 className={cn(
+                   "flex items-center gap-2 px-6 py-2.5 rounded-xl font-semibold text-sm transition-all duration-200",
+                   canGenerate
+                     ? "bg-gradient-to-r from-emerald-500 to-teal-500 text-white shadow-lg shadow-emerald-500/30 hover:shadow-emerald-500/50 hover:scale-[1.02]"
+                     : "bg-white/20 text-white/50 cursor-not-allowed"
+                 )}
                >
                  {isGenerating ? (
                    <>
-                     <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                     <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                      Exporting...
                    </>
                  ) : (
                    <>
-                     <Download className="w-5 h-5" />
+                     <Download className="w-4 h-4" />
                      Export AAS
                    </>
                  )}
@@ -4298,17 +5465,26 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left Panel - Submodels */}
-        <div className="w-64 border-r border-gray-200 dark:border-gray-700 overflow-y-auto" 
-             style={{ backgroundColor: "rgba(97, 202, 243, 0.1)" }}>
-          <div className="p-4 space-y-2">
+        <div className="w-72 border-r border-gray-200 dark:border-gray-700 overflow-y-auto bg-gradient-to-b from-[#61caf3]/5 to-[#61caf3]/10">
+          <div className="p-4 space-y-3">
+            {/* Section header */}
+            <div className="flex items-center gap-2 mb-4">
+              <Package className="w-5 h-5 text-[#61caf3]" />
+              <h3 className="font-semibold text-gray-800 dark:text-gray-200">Submodels</h3>
+              <span className="ml-auto px-2 py-0.5 bg-[#61caf3]/20 text-[#3a9fd4] text-xs font-medium rounded-full">
+                {aasConfig.selectedSubmodels.length}
+              </span>
+            </div>
+
             {/* AAS Thumbnail Upload Section */}
             <div className="mb-4">
-              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-2">
-                AAS Thumbnail
+              <label className="flex items-center gap-2 text-xs font-semibold text-gray-600 dark:text-gray-400 mb-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                Thumbnail
               </label>
               {thumbnail ? (
-                <div className="relative">
-                  <div className="w-full h-[150px] rounded-lg border-2 border-[#61caf3] shadow-md overflow-hidden flex items-center justify-center bg-white">
+                <div className="relative group">
+                  <div className="w-full h-[140px] rounded-xl border-2 border-[#61caf3] shadow-lg shadow-[#61caf3]/10 overflow-hidden flex items-center justify-center bg-white">
                     <img
                       src={thumbnail || "/placeholder.svg"}
                       alt="AAS Thumbnail"
@@ -4317,51 +5493,56 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                   </div>
                   <button
                     onClick={() => setThumbnail(null)}
-                    className="absolute top-2 right-2 p-1 bg-red-500 text-white rounded-full hover:bg-red-600 transition-colors"
+                    className="absolute top-2 right-2 p-1.5 bg-red-500 text-white rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-600 transition-all shadow-lg"
                     title="Remove thumbnail"
                   >
                     <X className="w-4 h-4" />
                   </button>
                 </div>
               ) : (
-                <label className="block">
+                <label className="block cursor-pointer">
                   <input
                     type="file"
                     accept="image/*"
                     onChange={handleThumbnailUpload}
                     className="hidden"
                   />
-                  <div className="w-full h-[150px] rounded-lg border-2 border-dashed border-[#adadae] hover:border-[#61caf3] cursor-pointer flex flex-col items-center justify-center text-gray-400 hover:text-[#61caf3] bg-white transition-all">
+                  <div className="w-full h-[140px] rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-[#61caf3] flex flex-col items-center justify-center text-gray-400 hover:text-[#61caf3] bg-white dark:bg-gray-800/50 transition-all hover:shadow-lg hover:shadow-[#61caf3]/10">
                     <Upload className="w-8 h-8 mb-2" />
-                    <span className="text-xs">Upload thumbnail</span>
+                    <span className="text-xs font-medium">Upload thumbnail</span>
                   </div>
                 </label>
               )}
             </div>
 
+            {/* Add Submodel Button */}
             <button
               onClick={() => {
                 loadTemplates()
                 setShowAddSubmodel(true)
               }}
-              className="w-full p-3 rounded-lg border-2 border-dashed border-[#61caf3] hover:bg-white/50 transition-all flex flex-col items-center gap-2"
+              className="w-full p-4 rounded-xl border-2 border-dashed border-[#61caf3]/50 hover:border-[#61caf3] hover:bg-[#61caf3]/10 transition-all flex flex-col items-center gap-2 group"
             >
-              <Plus className="w-5 h-5 text-[#61caf3]" />
-              <span className="text-xs text-[#61caf3] font-medium">Add Submodel</span>
+              <div className="w-10 h-10 rounded-full bg-[#61caf3]/20 group-hover:bg-[#61caf3]/30 flex items-center justify-center transition-colors">
+                <Plus className="w-5 h-5 text-[#61caf3]" />
+              </div>
+              <span className="text-xs text-[#61caf3] font-semibold">Add Submodel</span>
             </button>
 
+            {/* Submodel Cards */}
             {aasConfig.selectedSubmodels.map((sm, idx) => {
               const elements = submodelData[sm.idShort] || []
               const isSelected = selectedSubmodel?.idShort === sm.idShort
-              
+
               return (
                 <div
                   key={idx}
-                  className="p-3 rounded-lg cursor-pointer transition-all flex flex-col items-center gap-2 relative group"
-                  style={{
-                    border: isSelected ? "1px solid #61caf3" : "1px solid #adadae",
-                    backgroundColor: isSelected ? "white" : "transparent"
-                  }}
+                  className={cn(
+                    "p-4 rounded-xl cursor-pointer transition-all duration-200 flex flex-col items-center gap-3 relative group border-2",
+                    isSelected
+                      ? "border-[#61caf3] bg-white dark:bg-gray-800 shadow-lg shadow-[#61caf3]/20"
+                      : "border-gray-200 dark:border-gray-700 bg-white/50 dark:bg-gray-800/50 hover:border-[#61caf3]/50 hover:shadow-md"
+                  )}
                   onClick={() => {
                     setSelectedSubmodel(sm)
                     setSelectedElement(null)
@@ -4373,24 +5554,36 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                       e.stopPropagation()
                       removeSubmodel(sm.idShort)
                     }}
-                    className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute top-2 right-2 p-1.5 bg-red-500 text-white rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-600 transition-all"
+                    title="Remove submodel"
                   >
                     <X className="w-3 h-3" />
                   </button>
 
                   <div
-                    className="w-9 h-9 rounded-full flex items-center justify-center text-white"
-                    style={{ backgroundColor: isSelected ? "#61caf3" : "#adadae" }}
+                    className={cn(
+                      "w-12 h-12 rounded-xl flex items-center justify-center text-white transition-all",
+                      isSelected
+                        ? "bg-gradient-to-br from-[#61caf3] to-[#3a9fd4] shadow-lg shadow-[#61caf3]/30"
+                        : "bg-gray-300 dark:bg-gray-600"
+                    )}
                   >
-                    <FileText className="w-5 h-5" />
+                    <FileText className="w-6 h-6" />
                   </div>
-                  <span
-                    className="text-xs text-center truncate w-full"
-                    style={{ color: isSelected ? "#61caf3" : "#adadae", fontWeight: isSelected ? 600 : 400 }}
-                    title={sm.idShort}
-                  >
-                    {sm.idShort}
-                  </span>
+                  <div className="text-center">
+                    <span
+                      className={cn(
+                        "text-sm font-semibold block truncate max-w-[180px]",
+                        isSelected ? "text-[#3a9fd4]" : "text-gray-600 dark:text-gray-400"
+                      )}
+                      title={sm.idShort}
+                    >
+                      {sm.idShort}
+                    </span>
+                    <span className="text-[10px] text-gray-400">
+                      {elements.length} elements
+                    </span>
+                  </div>
                 </div>
               )
             })}
@@ -4398,34 +5591,94 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         </div>
 
         {/* Middle Panel - Tree Structure */}
-        <div className="flex-1 border-r border-gray-200 dark:border-gray-700 overflow-y-auto">
-          <div className="p-4">
+        <div className="flex-1 min-h-0 overflow-y-auto bg-white dark:bg-gray-900">
+          <div className="p-5">
+
+            {/* IMPROVED: Validation Summary and Quick Actions - only show when editing existing files */}
+            {sourceXml && (validationAlerts.length > 0 || internalIssues.length > 0 || externalIssues.length > 0) && (
+              <div className="mb-5 space-y-3">
+                {/* Quick Actions Bar */}
+                <div className="flex items-center justify-between p-4 rounded-xl bg-gradient-to-r from-gray-50 to-gray-100/50 dark:from-gray-800 dark:to-gray-800/50 border border-gray-200 dark:border-gray-700 shadow-sm">
+                  <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-2">
+                      {validationAlerts.filter(a => a.type === 'error').length > 0 && (
+                        <span className="flex items-center gap-1.5 px-3 py-1.5 bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 rounded-full text-xs font-semibold">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          {validationAlerts.filter(a => a.type === 'error').length} errors
+                        </span>
+                      )}
+                      {validationAlerts.filter(a => a.type === 'warning').length > 0 && (
+                        <span className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 rounded-full text-xs font-semibold">
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          {validationAlerts.filter(a => a.type === 'warning').length} warnings
+                        </span>
+                      )}
+                    </div>
+                    {countFixableAlerts(validationAlerts) > 0 && (
+                      <span className="text-sm text-gray-500 dark:text-gray-400">
+                        {countFixableAlerts(validationAlerts)} can be auto-fixed
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setValidationDialogDismissed(false);
+                        setValidationDialogOpen(true);
+                      }}
+                      className="px-4 py-2 rounded-lg text-sm font-medium border-2 border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 hover:border-[#61caf3] hover:text-[#3a9fd4] transition-all flex items-center gap-1.5"
+                    >
+                      <Eye className="w-4 h-4" />
+                      View All
+                    </button>
+                    <button
+                      onClick={handleFixClick}
+                      disabled={isFixing || validationBusy}
+                      className="px-4 py-2 rounded-lg text-sm font-semibold bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white hover:shadow-lg hover:shadow-[#61caf3]/30 transition-all flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                      <Wrench className="w-4 h-4" />
+                      {isFixing ? "Fixing..." : "Auto-Fix"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* ADD: Validation Panels */}
             {(internalIssues.length > 0) && (
               <div className="mb-4">
-                <Collapsible>
+                <Collapsible defaultOpen>
                   <CollapsibleTrigger className="flex items-center justify-between w-full p-3 rounded-lg border border-red-300 bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-200">
                     <div className="flex items-center gap-2">
                       <AlertCircle className="w-4 h-4" />
-                      <span>Missing Required Fields ({internalIssues.length})</span>
+                      <span className="font-medium">Missing Required Fields</span>
+                      <Badge variant="destructive" className="ml-1">{internalIssues.length}</Badge>
                     </div>
                     <ChevronDown className="w-4 h-4 transition-transform data-[state=open]:rotate-180" />
                   </CollapsibleTrigger>
-                  <CollapsibleContent className="border-x border-b border-red-200 dark:border-red-700 rounded-b-lg p-3">
-                    <ul className="list-disc list-inside text-sm space-y-2 text-red-800 dark:text-red-200">
-                      {internalIssues.map((msg, idx) => (
-                        <li key={idx} className="flex items-start justify-between gap-3">
-                          <span className="break-words">{msg}</span>
-                          <button
-                            onClick={() => goToIssuePath(msg)}
-                            className="shrink-0 px-2 py-1 text-xs bg-white dark:bg-gray-800 border border-red-300 dark:border-red-600 rounded hover:bg-red-100 dark:hover:bg-red-800/40"
-                          >
-                            Go to
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                  <CollapsibleContent className="border-x border-b border-red-200 dark:border-red-700 rounded-b-lg p-3 overflow-hidden">
+                    <ScrollArea className="h-48 max-h-48">
+                      <ul className="space-y-2 text-sm">
+                        {internalIssues.map((msg, idx) => (
+                          <li key={idx} className="flex items-start justify-between gap-3 p-2 rounded bg-white dark:bg-gray-900 border border-red-200 dark:border-red-700">
+                            <div className="text-red-800 dark:text-red-200">
+                              <span className="break-words">{msg}</span>
+                              <p className="text-xs text-red-600/70 dark:text-red-300/70 mt-1">
+                                This field is required for a valid AAS model
+                              </p>
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => goToIssuePath(msg)}
+                              className="shrink-0 h-7 px-2 text-xs border border-red-300 dark:border-red-600 hover:bg-red-100 dark:hover:bg-red-800/40"
+                            >
+                              Go to
+                            </Button>
+                          </li>
+                        ))}
+                      </ul>
+                    </ScrollArea>
                   </CollapsibleContent>
                 </Collapsible>
               </div>
@@ -4434,121 +5687,331 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
             {(externalIssues.length > 0) && (
               <div className="mb-4">
                 <Collapsible>
-                  <CollapsibleTrigger className="flex items-center justify-between w-full p-3 rounded-lg border border-yellow-300 bg-yellow-50 dark:bg-yellow-900/20 text-yellow-800 dark:text-yellow-200">
+                  <CollapsibleTrigger className="flex items-center justify-between w-full p-3 rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-200">
                     <div className="flex items-center gap-2">
-                      <AlertCircle className="w-4 h-4" />
-                      <span>XML Schema Errors ({xmlErrorsRaw.length || externalIssues.length})</span>
+                      <AlertTriangle className="w-4 h-4" />
+                      <span className="font-medium">XML Schema Issues</span>
+                      <Badge variant="outline" className="ml-1 border-amber-500 text-amber-600">{xmlErrorsRaw.length || externalIssues.length}</Badge>
                     </div>
                     <ChevronDown className="w-4 h-4 transition-transform data-[state=open]:rotate-180" />
                   </CollapsibleTrigger>
-                  <CollapsibleContent className="border-x border-b border-yellow-200 dark:border-yellow-700 rounded-b-lg p-3">
-                    {(() => {
-                      const source = xmlErrorsRaw.length ? xmlErrorsRaw : externalIssues;
-                      const friendly = buildFriendlyXmlErrors(source as any);
-                      return (
-                        <ul className="space-y-2 text-sm">
-                          {friendly.map((fe, idx) => (
-                            <li key={idx} className="flex items-start justify-between gap-3 p-2 rounded bg-white dark:bg-gray-800 border border-yellow-200 dark:border-yellow-700">
-                              <div className="text-yellow-800 dark:text-yellow-200">
-                                <div className="font-medium">{fe.message}</div>
-                                {fe.field && (
-                                  <div className="text-xs text-yellow-700/80 dark:text-yellow-300/80 mt-0.5">
-                                    Field: {fe.displayField ?? fe.field}
-                                  </div>
-                                )}
-                                {fe.hint && (
-                                  <div className="text-xs text-yellow-700/80 dark:text-yellow-300/80 mt-0.5">
-                                    {fe.hint}
-                                  </div>
-                                )}
-                                {fe.path && (
-                                  <div className="text-[11px] text-gray-500 mt-0.5">
-                                    Path: {fe.path}
-                                  </div>
-                                )}
-                              </div>
-                              {fe.path ? (
-                                <button
-                                  onClick={() => goToIssuePath(fe.path!)}
-                                  className="shrink-0 px-2 py-1 text-xs bg-white dark:bg-gray-900 border border-yellow-300 dark:border-yellow-600 rounded hover:bg-yellow-100 dark:hover:bg-yellow-800/40"
-                                >
-                                  Go to
-                                </button>
-                              ) : null}
-                            </li>
-                          ))}
-                        </ul>
-                      )
-                    })()}
+                  <CollapsibleContent className="border-x border-b border-amber-200 dark:border-amber-700 rounded-b-lg p-3 overflow-hidden">
+                    <ScrollArea className="h-64 max-h-64 overflow-y-auto">
+                      <ul className="space-y-2 text-sm">
+                        {memoizedFriendlyXmlErrors.map((fe, idx) => (
+                          <li key={idx} className="flex items-start justify-between gap-3 p-2 rounded bg-white dark:bg-gray-900 border border-amber-200 dark:border-amber-700">
+                            <div className="text-amber-800 dark:text-amber-200 flex-1">
+                              <div className="font-medium text-sm">{fe.message}</div>
+                              {fe.field && (
+                                <div className="text-xs text-amber-700/80 dark:text-amber-300/80 mt-1 flex items-center gap-1">
+                                  <span className="font-medium">Field:</span> {fe.displayField ?? fe.field}
+                                </div>
+                              )}
+                              {fe.hint && (
+                                <div className="text-xs text-amber-600/80 dark:text-amber-400/80 mt-1 p-2 bg-amber-100/50 dark:bg-amber-900/30 rounded border-l-2 border-amber-400">
+                                  <Info className="w-3 h-3 inline mr-1" />
+                                  {fe.hint}
+                                </div>
+                              )}
+                              {fe.path && (
+                                <div className="text-[11px] text-gray-500 mt-1 font-mono">
+                                  Path: {fe.path}
+                                </div>
+                              )}
+                            </div>
+                            {fe.path ? (
+                              <button
+                                onClick={() => goToIssuePath(fe.path!)}
+                                className="shrink-0 px-2 py-1 text-xs bg-white dark:bg-gray-900 border border-yellow-300 dark:border-yellow-600 rounded hover:bg-yellow-100 dark:hover:bg-yellow-800/40"
+                              >
+                                Go to
+                              </button>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    </ScrollArea>
                   </CollapsibleContent>
                 </Collapsible>
-                <AasEditorDebugXML xml={lastGeneratedXml} />
               </div>
             )}
 
             {selectedSubmodel ? (
               <>
-                <div className="flex items-center justify-between mb-4 pb-3 border-b">
-                  <div className="flex items-center gap-2">
-                    <span className="px-2 py-1 bg-[#61caf3] text-white text-xs font-semibold rounded">
-                      SM
-                    </span>
-                    <span className="font-semibold">{selectedSubmodel.idShort}</span>
+                {/* Submodel Header */}
+                <div className="flex items-center justify-between mb-4 pb-4 border-b border-gray-200 dark:border-gray-700">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-gradient-to-br from-[#61caf3] to-[#3a9fd4] rounded-xl shadow-lg shadow-[#61caf3]/20">
+                      <FileText className="w-5 h-5 text-white" />
+                    </div>
+                    <div>
+                      <h3 className="font-bold text-gray-900 dark:text-white">{selectedSubmodel.idShort}</h3>
+                      <span className="text-xs text-gray-500">Submodel</span>
+                    </div>
                   </div>
-                  <span className="text-sm text-gray-500">
-                    {submodelData[selectedSubmodel.idShort]?.length || 0} elements
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="px-3 py-1.5 bg-[#61caf3]/10 text-[#3a9fd4] text-sm font-semibold rounded-full">
+                      {submodelData[selectedSubmodel.idShort]?.length || 0} elements
+                    </span>
+                    {editMode && (
+                      <button
+                        onClick={() => openAddElementDialog(null)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white text-sm font-semibold rounded-full hover:shadow-lg hover:shadow-[#61caf3]/30 transition-all"
+                        title="Add new element to this submodel"
+                      >
+                        <Plus className="w-4 h-4" />
+                        Add
+                      </button>
+                    )}
+                  </div>
                 </div>
-                {submodelData[selectedSubmodel.idShort]?.map((element, idx) =>
+
+                {/* Search and Tree Controls */}
+                <div className="flex items-center gap-2 mb-4">
+                  {/* Search Input */}
+                  <div className="relative flex-1">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                    <Input
+                      ref={(el) => { if (treeSearchFocused && el) { el.focus(); setTreeSearchFocused(false); } }}
+                      value={treeSearchQuery}
+                      onChange={(e) => setTreeSearchQuery(e.target.value)}
+                      placeholder="Search elements... (Ctrl+F)"
+                      className="pl-10 h-9 text-sm bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700"
+                    />
+                    {treeSearchQuery && (
+                      <button
+                        onClick={() => setTreeSearchQuery("")}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {/* Expand/Collapse All */}
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={expandAll}
+                          className="p-2 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                          aria-label="Expand all"
+                        >
+                          <ChevronsDownUp className="w-4 h-4" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>Expand all</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={collapseAll}
+                          className="p-2 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                          aria-label="Collapse all"
+                        >
+                          <ChevronsUpDown className="w-4 h-4" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>Collapse all</TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+
+                {/* Breadcrumb Navigation */}
+                {selectedElement && selectedElementPath.length > 0 && (
+                  <div className="flex items-center gap-1 mb-4 px-3 py-2 bg-gray-50 dark:bg-gray-800/50 rounded-lg text-sm overflow-x-auto">
+                    <button
+                      onClick={() => { setSelectedElement(null); setSelectedElementPath([]); }}
+                      className="flex items-center gap-1 text-gray-500 hover:text-[#61caf3] transition-colors shrink-0"
+                    >
+                      <Home className="w-3.5 h-3.5" />
+                    </button>
+                    {selectedElementPath.map((segment, idx) => (
+                      <div key={idx} className="flex items-center gap-1 shrink-0">
+                        <ChevronRight className="w-3.5 h-3.5 text-gray-400" />
+                        <button
+                          onClick={() => {
+                            // Navigate to this level in the tree
+                            const pathToHere = selectedElementPath.slice(0, idx + 1);
+                            // Find and select this element
+                            let current: SubmodelElement | null = null;
+                            let elements = submodelData[selectedSubmodel.idShort] || [];
+                            for (const seg of pathToHere) {
+                              current = elements.find(e => e.idShort === seg) || null;
+                              if (current?.children) elements = current.children;
+                            }
+                            if (current) {
+                              setSelectedElement(current);
+                              setSelectedElementPath(pathToHere);
+                            }
+                          }}
+                          className={cn(
+                            "px-1.5 py-0.5 rounded transition-colors",
+                            idx === selectedElementPath.length - 1
+                              ? "font-semibold text-[#61caf3] bg-[#61caf3]/10"
+                              : "text-gray-600 dark:text-gray-400 hover:text-[#61caf3] hover:bg-[#61caf3]/5"
+                          )}
+                        >
+                          {segment}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Search Results Info */}
+                {treeSearchQuery && (
+                  <div className="mb-3 text-sm text-gray-500 dark:text-gray-400">
+                    {filteredElements.length === 0 ? (
+                      <span className="text-amber-600 dark:text-amber-400">No elements match "{treeSearchQuery}"</span>
+                    ) : (
+                      <span>Showing {filteredElements.length} matching element{filteredElements.length !== 1 ? 's' : ''}</span>
+                    )}
+                  </div>
+                )}
+
+                {/* Tree Nodes */}
+                {(treeSearchQuery ? filteredElements : submodelData[selectedSubmodel.idShort])?.map((element, idx) =>
                   renderTreeNode(element, 0, [element.idShort], idx, submodelData[selectedSubmodel.idShort])
+                )}
+                {/* Drop zone for moving elements to root level */}
+                {draggedItem && (
+                  <div
+                    onDragOver={(e) => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      // Only show if dragged item is not at root level
+                      if (draggedItem.path.length > 1) {
+                        setDragOverContainer('__root__')
+                      }
+                    }}
+                    onDragLeave={() => setDragOverContainer(null)}
+                    onDrop={(e) => {
+                      e.preventDefault()
+                      if (!draggedItem || !selectedSubmodel) return
+                      if (draggedItem.path.length > 1) {
+                        // Move to root level
+                        moveElement(selectedSubmodel.idShort, draggedItem.path, [])
+                      }
+                      setDraggedItem(null)
+                      setDragOverItem(null)
+                      setDragOverContainer(null)
+                    }}
+                    className={cn(
+                      "mt-2 p-3 border-2 border-dashed rounded-xl text-center text-sm transition-all",
+                      dragOverContainer === '__root__'
+                        ? "border-[#61caf3] bg-[#61caf3]/10 text-[#3a9fd4]"
+                        : "border-gray-300 dark:border-gray-600 text-gray-400"
+                    )}
+                  >
+                    Drop here to move to root level
+                  </div>
+                )}
+                {/* Add Element at bottom when empty or as alternative */}
+                {editMode && (submodelData[selectedSubmodel.idShort]?.length || 0) === 0 && (
+                  <div className="flex flex-col items-center justify-center py-12 text-center">
+                    <div className="w-16 h-16 rounded-2xl bg-[#61caf3]/10 flex items-center justify-center mb-4">
+                      <Plus className="w-8 h-8 text-[#61caf3]" />
+                    </div>
+                    <p className="text-gray-500 dark:text-gray-400 font-medium mb-4">No elements yet</p>
+                    <button
+                      onClick={() => openAddElementDialog(null)}
+                      className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white font-semibold rounded-xl hover:shadow-lg hover:shadow-[#61caf3]/30 transition-all"
+                    >
+                      <Plus className="w-5 h-5" />
+                      Add First Element
+                    </button>
+                  </div>
                 )}
               </>
             ) : (
-              <div className="flex items-center justify-center h-full text-gray-500">
-                Select a submodel to view its structure
+              <div className="flex flex-col items-center justify-center h-64 text-center">
+                <div className="w-16 h-16 rounded-2xl bg-[#61caf3]/10 flex items-center justify-center mb-4">
+                  <Package className="w-8 h-8 text-[#61caf3]" />
+                </div>
+                <p className="text-gray-500 dark:text-gray-400 font-medium">Select a submodel to view its structure</p>
+                <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">Choose from the sidebar on the left</p>
               </div>
             )}
           </div>
         </div>
 
         {/* Right Panel - Editable Fields (locked when Edit is off) */}
-        <div className={`w-96 overflow-y-auto bg-gray-50 dark:bg-gray-800 ${editMode ? "" : "pointer-events-none opacity-70"}`}>
+        <div className={cn(
+          "w-96 overflow-y-auto bg-gradient-to-b from-gray-50 to-gray-100/50 dark:from-gray-800 dark:to-gray-900/50 border-l border-gray-200 dark:border-gray-700",
+          editMode ? "" : "pointer-events-none opacity-60"
+        )}>
           {renderEditableDetails()}
         </div>
       </div>
 
-      {/* Submodel selection dialog */}
+      {/* Submodel selection dialog - Beautiful styled */}
       {showAddSubmodel && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-[600px] max-h-[600px] flex flex-col">
-            <div className="p-4 border-b flex items-center justify-between">
-              <h3 className="text-lg font-semibold">Add Submodel Template</h3>
-              <button
-                onClick={() => {
-                  setShowAddSubmodel(false)
-                  setSearchQuery("")
-                }}
-                className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-              >
-                <X className="w-5 h-5" />
-              </button>
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-[650px] max-h-[650px] flex flex-col overflow-hidden border-0">
+            {/* Gradient Header */}
+            <div className="relative bg-gradient-to-br from-[#61caf3] via-[#4db6e6] to-[#3a9fd4] px-6 py-5">
+              <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxwYXRoIGQ9Ik0zNiAxOGMtOS45NDEgMC0xOCA4LjA1OS0xOCAxOHM4LjA1OSAxOCAxOCAxOCAxOC04LjA1OSAxOC0xOC04LjA1OS0xOC0xOC0xOHptMCAzMmMtNy43MzIgMC0xNC02LjI2OC0xNC0xNHM2LjI2OC0xNCAxNC0xNCAxNCA2LjI2OCAxNCAxNC02LjI2OCAxNC0xNCAxNHoiIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iLjA1Ii8+PC9nPjwvc3ZnPg==')] opacity-30" />
+              <div className="relative z-10 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-white/20 backdrop-blur-sm rounded-xl">
+                    <Package className="w-5 h-5 text-white" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Add Submodel Template</h3>
+                    <p className="text-white/70 text-sm">Choose from IDTA standard templates</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setShowAddSubmodel(false)
+                    setSearchQuery("")
+                  }}
+                  className="p-2 bg-white/20 hover:bg-white/30 rounded-xl transition-colors"
+                >
+                  <X className="w-5 h-5 text-white" />
+                </button>
+              </div>
             </div>
-            <div className="p-4 border-b">
-              <input
-                type="text"
-                placeholder="Search submodels..."
-                value={templateSearchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-900 focus:ring-2 focus:ring-[#61caf3] focus:border-transparent"
-              />
+
+            {/* Search Bar */}
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <div className="relative">
+                <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                <input
+                  type="text"
+                  placeholder="Search templates..."
+                  value={templateSearchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full pl-11 pr-4 py-3 rounded-xl border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:border-[#61caf3] focus:ring-4 focus:ring-[#61caf3]/20 transition-all placeholder:text-gray-400"
+                />
+              </div>
             </div>
+
+            {/* Template List */}
             <div className="flex-1 overflow-y-auto p-4">
               {loadingTemplates ? (
-                <div className="text-center py-8 text-gray-500">Loading templates...</div>
+                <div className="flex flex-col items-center justify-center py-12">
+                  <div className="relative">
+                    <div className="w-12 h-12 rounded-full border-4 border-[#61caf3]/20" />
+                    <div className="w-12 h-12 rounded-full border-4 border-[#61caf3] border-t-transparent animate-spin absolute inset-0" />
+                  </div>
+                  <p className="mt-4 text-sm text-gray-500 dark:text-gray-400">Loading templates from IDTA...</p>
+                </div>
               ) : filteredTemplates.length === 0 ? (
-                <div className="text-center py-8 text-gray-500">No templates found matching "{templateSearchQuery}"</div>
+                <div className="text-center py-12">
+                  <Search className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
+                  <p className="text-gray-500 dark:text-gray-400">No templates found matching "{templateSearchQuery}"</p>
+                  <button
+                    onClick={() => setSearchQuery("")}
+                    className="mt-2 text-sm text-[#61caf3] hover:underline"
+                  >
+                    Clear search
+                  </button>
+                </div>
               ) : (
-                <div className="space-y-2">
+                <div className="grid gap-3">
                   {filteredTemplates.map((template, idx) => (
                     <button
                       key={idx}
@@ -4556,14 +6019,249 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                         addSubmodel(template)
                         setSearchQuery("")
                       }}
-                      className="w-full p-3 text-left border rounded-lg hover:border-[#61caf3] hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all"
+                      className="w-full p-4 text-left rounded-xl border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/50 hover:border-[#61caf3] hover:shadow-lg hover:shadow-[#61caf3]/10 transition-all duration-200 group"
                     >
-                      <div className="font-medium">{template.name}</div>
-                      <div className="text-sm text-gray-500">{template.description}</div>
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <h4 className="font-semibold text-gray-900 dark:text-white truncate group-hover:text-[#3a9fd4] transition-colors">
+                              {template.name}
+                            </h4>
+                            <span className="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 text-xs rounded-full shrink-0">
+                              v{template.version}
+                            </span>
+                          </div>
+                          <p className="text-sm text-gray-500 dark:text-gray-400 line-clamp-2">
+                            {template.description}
+                          </p>
+                        </div>
+                        <div className="p-2.5 bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white rounded-xl opacity-0 group-hover:opacity-100 transition-all duration-200 shrink-0">
+                          <Plus className="w-5 h-5" />
+                        </div>
+                      </div>
                     </button>
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Element Dialog */}
+      {showAddElementDialog && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-[550px] max-h-[90vh] flex flex-col overflow-hidden border-0">
+            {/* Gradient Header */}
+            <div className="relative bg-gradient-to-br from-[#61caf3] via-[#4db6e6] to-[#3a9fd4] px-6 py-5">
+              <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxwYXRoIGQ9Ik0zNiAxOGMtOS45NDEgMC0xOCA4LjA1OS0xOCAxOHM4LjA1OSAxOCAxOCAxOCAxOC04LjA1OSAxOC0xOC04LjA1OS0xOC0xOC0xOHptMCAzMmMtNy43MzIgMC0xNC02LjI2OC0xNC0xNHM2LjI2OC0xNCAxNC0xNCAxNCA2LjI2OCAxNCAxNC02LjI2OCAxNC0xNCAxNHoiIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iLjA1Ii8+PC9nPjwvc3ZnPg==')] opacity-30" />
+              <div className="relative z-10 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-white/20 backdrop-blur-sm rounded-xl">
+                    <Plus className="w-5 h-5 text-white" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-bold text-white">Add Submodel Element</h3>
+                    <p className="text-white/70 text-sm">
+                      {addElementParentPath && addElementParentPath.length > 0
+                        ? `Adding to: ${addElementParentPath.join(" > ")}`
+                        : `Adding to: ${selectedSubmodel?.idShort || "Submodel"} (root)`}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowAddElementDialog(false)}
+                  className="p-2 bg-white/20 hover:bg-white/30 rounded-xl transition-colors"
+                >
+                  <X className="w-5 h-5 text-white" />
+                </button>
+              </div>
+            </div>
+
+            {/* Form Content */}
+            <div className="flex-1 overflow-y-auto p-6 space-y-5">
+              {/* Element Type Selection */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-3">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                  Element Type
+                  <span className="text-red-400 text-xs">required</span>
+                </label>
+                <div className="grid grid-cols-2 gap-2 max-h-[200px] overflow-y-auto pr-2">
+                  {ALL_ELEMENT_TYPES.map((type) => (
+                    <button
+                      key={type.value}
+                      type="button"
+                      onClick={() => setNewElementType(type.value)}
+                      className={cn(
+                        "text-left p-3 rounded-xl border-2 transition-all duration-200",
+                        newElementType === type.value
+                          ? "border-[#61caf3] bg-gradient-to-br from-cyan-50 to-sky-50 dark:from-cyan-900/20 dark:to-sky-900/20"
+                          : "border-gray-200 dark:border-gray-700 hover:border-[#61caf3]/50"
+                      )}
+                    >
+                      <div className="font-medium text-sm text-gray-900 dark:text-white">{type.label}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{type.description}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* idShort */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                  idShort
+                  <span className="text-red-400 text-xs">required</span>
+                </label>
+                <input
+                  type="text"
+                  value={newElementIdShort}
+                  onChange={(e) => setNewElementIdShort(e.target.value)}
+                  placeholder="e.g., MyProperty, ContactInfo"
+                  className={cn(
+                    "w-full px-4 py-3 rounded-xl text-gray-900 dark:text-white transition-all duration-200",
+                    "bg-white dark:bg-gray-800/50 border-2",
+                    "focus:outline-none focus:ring-4 focus:ring-[#61caf3]/20",
+                    "placeholder:text-gray-400 dark:placeholder:text-gray-500",
+                    newElementIdShort && !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(newElementIdShort)
+                      ? "border-red-400 focus:border-red-400"
+                      : "border-gray-200 dark:border-gray-700 focus:border-[#61caf3]"
+                  )}
+                />
+                {newElementIdShort && !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(newElementIdShort) && (
+                  <p className="mt-2 text-xs text-red-500 flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3" />
+                    Must start with a letter, contain only letters, digits, "_" or "-"
+                  </p>
+                )}
+              </div>
+
+              {/* Cardinality */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                  Cardinality
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {(["One", "ZeroToOne", "ZeroToMany", "OneToMany"] as const).map((card) => (
+                    <button
+                      key={card}
+                      type="button"
+                      onClick={() => setNewElementCardinality(card)}
+                      className={cn(
+                        "px-3 py-2 rounded-xl font-medium text-sm transition-all duration-200 border-2",
+                        newElementCardinality === card
+                          ? "bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white border-transparent shadow-lg shadow-[#61caf3]/25"
+                          : "bg-white dark:bg-gray-800/50 text-gray-600 dark:text-gray-300 border-gray-200 dark:border-gray-700 hover:border-[#61caf3]/50"
+                      )}
+                    >
+                      {card === "One" ? "1" : card === "ZeroToOne" ? "0..1" : card === "ZeroToMany" ? "0..*" : "1..*"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* ValueType (for Property and Range) */}
+              {(newElementType === "Property" || newElementType === "Range") && (
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                    Value Type
+                  </label>
+                  <select
+                    value={newElementValueType}
+                    onChange={(e) => setNewElementValueType(e.target.value)}
+                    className="w-full px-4 py-3 rounded-xl border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:border-[#61caf3] focus:ring-4 focus:ring-[#61caf3]/20"
+                  >
+                    {XSD_VALUE_TYPES.map((vt) => (
+                      <option key={vt} value={vt}>{vt}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Entity Type (for Entity) */}
+              {newElementType === "Entity" && (
+                <div>
+                  <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
+                    Entity Type
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(["CoManagedEntity", "SelfManagedEntity"] as const).map((et) => (
+                      <button
+                        key={et}
+                        type="button"
+                        onClick={() => setNewElementEntityType(et)}
+                        className={cn(
+                          "px-4 py-3 rounded-xl font-medium text-sm transition-all duration-200 border-2",
+                          newElementEntityType === et
+                            ? "bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white border-transparent shadow-lg shadow-[#61caf3]/25"
+                            : "bg-white dark:bg-gray-800/50 text-gray-600 dark:text-gray-300 border-gray-200 dark:border-gray-700 hover:border-[#61caf3]/50"
+                        )}
+                      >
+                        {et === "CoManagedEntity" ? "Co-Managed" : "Self-Managed"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Semantic ID (optional) */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-gray-300" />
+                  Semantic ID
+                  <span className="text-gray-400 text-xs">optional</span>
+                </label>
+                <input
+                  type="text"
+                  value={newElementSemanticId}
+                  onChange={(e) => setNewElementSemanticId(e.target.value)}
+                  placeholder="e.g., https://admin-shell.io/..."
+                  className="w-full px-4 py-3 rounded-xl border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:border-[#61caf3] focus:ring-4 focus:ring-[#61caf3]/20 placeholder:text-gray-400"
+                />
+              </div>
+
+              {/* Description (optional) */}
+              <div>
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-gray-300" />
+                  Description
+                  <span className="text-gray-400 text-xs">optional</span>
+                </label>
+                <textarea
+                  value={newElementDescription}
+                  onChange={(e) => setNewElementDescription(e.target.value)}
+                  placeholder="Brief description of this element..."
+                  rows={2}
+                  className="w-full px-4 py-3 rounded-xl border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:border-[#61caf3] focus:ring-4 focus:ring-[#61caf3]/20 placeholder:text-gray-400 resize-none"
+                />
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div className="px-6 py-4 bg-gradient-to-r from-gray-50 to-gray-100/50 dark:from-gray-900/80 dark:to-gray-800/50 border-t border-gray-200/50 dark:border-gray-700/50 flex justify-end gap-3">
+              <button
+                onClick={() => setShowAddElementDialog(false)}
+                className="px-5 py-2.5 rounded-xl bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 border-2 border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 transition-all font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={addElement}
+                disabled={!newElementIdShort.trim() || !/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(newElementIdShort)}
+                className={cn(
+                  "flex items-center gap-2 px-6 py-2.5 rounded-xl font-semibold transition-all duration-200",
+                  newElementIdShort.trim() && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(newElementIdShort)
+                    ? "bg-gradient-to-r from-[#61caf3] to-[#4db6e6] text-white shadow-lg shadow-[#61caf3]/25 hover:shadow-[#61caf3]/40 hover:scale-[1.02]"
+                    : "bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed"
+                )}
+              >
+                <Plus className="w-5 h-5" />
+                Add Element
+              </button>
             </div>
           </div>
         </div>
@@ -4626,49 +6324,19 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         </DialogContent>
       </Dialog>
 
-      {/* Validation Result Dialog */}
-      <Dialog
+      {/* NEW: Improved Validation Result Dialog */}
+      <ValidationDialog
         open={validationDialogOpen}
         onOpenChange={(open) => {
           setValidationDialogOpen(open);
-          if (!open) setValidationDialogDismissed(true); // mark as dismissed only when closing
+          if (!open) setValidationDialogDismissed(true);
         }}
-      >
-        <DialogContent showCloseButton>
-          <DialogHeader>
-            <DialogTitle>Validation Result</DialogTitle>
-            <DialogDescription>
-              Summary of checks for required fields, JSON structure, and XML schema compliance.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-3 text-center">
-            <div className="text-lg font-semibold">
-              {validationDialogStatus === 'valid' ? 'Valid' : 'Invalid'}
-            </div>
-            <div className="text-sm text-gray-600 dark:text-gray-300">
-              Found {validationCounts.internal + validationCounts.json + validationCounts.xml} issue(s).
-            </div>
-            <div className="text-sm text-gray-600 dark:text-gray-300">
-              <ul className="list-none space-y-1">
-                <li>Required fields/type: {validationCounts.internal}</li>
-                <li>JSON validation: {validationCounts.json}</li>
-                <li>XML schema: {validationCounts.xml}</li>
-              </ul>
-            </div>
-          </div>
-
-          <DialogFooter>
-            <Button
-              onClick={handleFixClick}
-              disabled={isFixing || validationBusy}
-              className="bg-[#61caf3] hover:bg-[#4db6e6] text-white disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {isFixing ? "Fixing..." : "Fix Errors"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        alerts={validationAlerts}
+        isFixing={isFixing}
+        onFix={sourceXml ? handleFixClick : undefined}
+        onGoToPath={goToIssuePath}
+        title={validationDialogStatus === 'valid' ? "Validation Passed" : "Validation Results"}
+      />
 
       {/* Popup: No PDFs found */}
       <AlertDialog open={noPdfsDialogOpen} onOpenChange={setNoPdfsDialogOpen}>
