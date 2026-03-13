@@ -75,7 +75,20 @@ export function AASCreator({ onProceedToEditor, onClose }: { onProceedToEditor: 
         toast.info("Using cached templates — GitHub API rate limit reached")
       }
 
-      setTemplates(fetched)
+      // Ensure Capability Description is always available
+      const hasCapability = fetched.some(t => t.name === 'CapabilityDescription')
+      const merged = hasCapability
+        ? fetched
+        : [
+            ...fetched,
+            {
+              name: 'CapabilityDescription',
+              version: '1.0',
+              description: 'IDTA 02020-1-0 Capability Description submodel — describes offered/required capabilities with properties and constraints',
+              url: 'https://admin-shell.io/idta/CapabilityDescription/1/0/Submodel',
+            },
+          ]
+      setTemplates(merged)
     } catch (error) {
       console.error("Error loading templates:", error)
       setApiError("Could not load templates from GitHub.")

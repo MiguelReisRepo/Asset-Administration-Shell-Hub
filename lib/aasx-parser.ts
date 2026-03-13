@@ -21,6 +21,7 @@ export interface AASXElement {
 export interface AASXSubmodel {
   idShort: string
   id: string
+  semanticId?: string
   submodelElements: AASXElement[]
 }
 
@@ -276,7 +277,9 @@ export function parseAASXML(xmlString: string): AASXData | null {
   submodelElements.forEach((submodelEl, smIndex) => {
     const smIdShort = getTextContent(submodelEl, "idShort")
     const smId = getTextContent(submodelEl, "id")
-    console.log(`[v0] PARSER V2: Processing submodel ${smIndex + 1}: ${smIdShort}`)
+    const smSemanticIdEl = submodelEl.querySelector("semanticId keys key value")
+    const smSemanticId = smSemanticIdEl?.textContent?.trim() || undefined
+    console.log(`[v0] PARSER V2: Processing submodel ${smIndex + 1}: ${smIdShort} (semanticId: ${smSemanticId || 'none'})`)
 
     const submodelElements: AASXElement[] = []
     const elementsContainer = submodelEl.querySelector("submodelElements")
@@ -297,6 +300,7 @@ export function parseAASXML(xmlString: string): AASXData | null {
     submodels.push({
       idShort: smIdShort,
       id: smId,
+      ...(smSemanticId ? { semanticId: smSemanticId } : {}),
       submodelElements,
     })
 

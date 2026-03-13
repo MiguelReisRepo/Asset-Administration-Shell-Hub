@@ -13,6 +13,9 @@ import { Textarea } from "@/components/ui/textarea"
 import { toast } from "sonner"
 import KeysEditor from "@/components/keys-editor"
 import { validateAASStructure } from "@/lib/json-validator"
+import { parseCapabilitySubmodel } from "@/lib/parsers/capability-parser"
+import type { ParsedCapabilitySubmodel } from "@/lib/types/capability"
+import { CapabilityCard } from "@/components/submodels/capability/CapabilityCard"
 
 // ADD: same options as editor
 const IEC_DATA_TYPES = [
@@ -149,6 +152,38 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
   const [validationErrorPaths, setValidationErrorPaths] = useState<Set<string>>(new Set())
   // NEW: live schema errors (updated every Validate click)
   const [liveErrors, setLiveErrors] = useState<(string | { message: string })[]>([])
+  // Capability submodel parsed data (computed when a capability submodel is selected)
+  const [capabilityData, setCapabilityData] = useState<ParsedCapabilitySubmodel | null>(null)
+
+  // Detect and parse capability submodels from the original XML
+  const isCapabilitySubmodelSelected = !!(
+    selectedSubmodel?.semanticId &&
+    selectedSubmodel.semanticId.includes('CapabilityDescription') &&
+    selectedSubmodel.semanticId.includes('Submodel')
+  )
+
+  useEffect(() => {
+    if (!isCapabilitySubmodelSelected || !selectedFile?.originalXml || !selectedSubmodel?.id) {
+      setCapabilityData(null)
+      return
+    }
+    try {
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(selectedFile.originalXml, 'text/xml')
+      const submodels = doc.querySelectorAll('submodel')
+      for (let i = 0; i < submodels.length; i++) {
+        const sm = submodels[i]
+        const idEl = sm.querySelector('id')
+        if (idEl?.textContent?.trim() === selectedSubmodel.id) {
+          setCapabilityData(parseCapabilitySubmodel(sm))
+          return
+        }
+      }
+      setCapabilityData(null)
+    } catch {
+      setCapabilityData(null)
+    }
+  }, [isCapabilitySubmodelSelected, selectedFile?.originalXml, selectedSubmodel?.id])
 
   // Copy helper for AAS fields
   const copyText = (label: string, value?: string) => {
@@ -1786,14 +1821,28 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
                         <span>Hide empty</span>
                       </label>
                       <span className="aasx-submodel-element-count">
-                        {selectedSubmodel.submodelElements?.length || 0} elements
+                        {isCapabilitySubmodelSelected && capabilityData
+                          ? `${capabilityData.capabilities.length} capabilities`
+                          : `${selectedSubmodel.submodelElements?.length || 0} elements`}
                       </span>
                     </div>
                   </div>
                   {/* Scrollable tree container */}
                   <div className="flex-1 min-h-0 overflow-y-auto">
-                    {selectedSubmodel.submodelElements?.map((element: any) =>
-                      renderTreeNode(element, 0, "", []),
+                    {isCapabilitySubmodelSelected && capabilityData ? (
+                      <div className="p-4 grid gap-4">
+                        {capabilityData.capabilities.length > 0 ? (
+                          capabilityData.capabilities.map((cap) => (
+                            <CapabilityCard key={cap.containerIdShort} capability={cap} />
+                          ))
+                        ) : (
+                          <div className="text-sm text-muted-foreground">No capabilities found in this submodel.</div>
+                        )}
+                      </div>
+                    ) : (
+                      selectedSubmodel.submodelElements?.map((element: any) =>
+                        renderTreeNode(element, 0, "", []),
+                      )
                     )}
                   </div>
                 </>
