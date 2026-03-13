@@ -43,7 +43,7 @@ export function AASCreator({ onProceedToEditor, onClose }: { onProceedToEditor: 
   const [selectedSubmodels, setSelectedSubmodels] = useState<SelectedSubmodel[]>([])
   const [aasIdShort, setAasIdShort] = useState("MyAssetAdministrationShell")
   const [aasId, setAasId] = useState("https://example.com/aas/1")
-  const [assetKind, setAssetKind] = useState<"Instance" | "Type">("Instance")
+  const [assetKind, setAssetKind] = useState<"Instance" | "Type">("Type")
   const [globalAssetId, setGlobalAssetId] = useState("https://example.com/asset/1")
   const [searchQuery, setSearchQuery] = useState("")
   const [step, setStep] = useState<1 | 2>(1)
@@ -339,7 +339,7 @@ export function AASCreator({ onProceedToEditor, onClose }: { onProceedToEditor: 
                   <span className="text-red-400 text-xs">required</span>
                 </label>
                 <div className="flex gap-2">
-                  {(["Instance", "Type"] as const).map((kind) => (
+                  {(["Type", "Instance"] as const).map((kind) => (
                     <button
                       key={kind}
                       type="button"

@@ -5,6 +5,8 @@ import {
 } from '@/lib/parsers/capability-parser'
 
 const AAS_NS = 'https://admin-shell.io/aas/3/0'
+const CAP_SET_SEM_ID = 'https://admin-shell.io/idta/CapabilityDescription/CapabilitySet/1/0'
+const CAP_SET_SEMANTIC_XML = `<semanticId><keys><key><type>GlobalReference</type><value>${CAP_SET_SEM_ID}</value></key></keys></semanticId>`
 
 function parseXml(xml: string): Document {
   return new DOMParser().parseFromString(xml, 'text/xml')
@@ -47,6 +49,22 @@ describe('isCapabilitySubmodel', () => {
     expect(isCapabilitySubmodel(getRoot(xml))).toBe(false)
   })
 
+  it('returns false for a similar but non-matching semantic ID', () => {
+    const xml = `
+      <submodel xmlns="${AAS_NS}">
+        <semanticId>
+          <keys>
+            <key>
+              <type>GlobalReference</type>
+              <value>https://admin-shell.io/idta/CapabilityDescription/1/0/SubmodelTemplate</value>
+            </key>
+          </keys>
+        </semanticId>
+      </submodel>
+    `
+    expect(isCapabilitySubmodel(getRoot(xml))).toBe(false)
+  })
+
   it('returns false for a submodel with no semanticId', () => {
     const xml = `
       <submodel xmlns="${AAS_NS}">
@@ -72,6 +90,7 @@ describe('parseCapabilitySubmodel', () => {
       <submodelElements>
         <submodelElementCollection>
           <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
           <value>
             <submodelElementCollection>
               <idShort>WeldingProcess</idShort>
@@ -233,6 +252,125 @@ describe('parseCapabilitySubmodel', () => {
   })
 })
 
+describe('parseCapabilitySubmodel — multiple CapabilitySets', () => {
+  it('collects capabilities from all CapabilitySets', () => {
+    const xml = `
+      <submodel xmlns="${AAS_NS}">
+        <id>urn:example:sm:multi</id>
+        <submodelElements>
+          <submodelElementCollection>
+            <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
+            <value>
+              <submodelElementCollection>
+                <idShort>Cap1</idShort>
+                <value>
+                  <capability><idShort>Cap1</idShort></capability>
+                </value>
+              </submodelElementCollection>
+            </value>
+          </submodelElementCollection>
+          <submodelElementCollection>
+            <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
+            <value>
+              <submodelElementCollection>
+                <idShort>Cap2</idShort>
+                <value>
+                  <capability><idShort>Cap2</idShort></capability>
+                </value>
+              </submodelElementCollection>
+            </value>
+          </submodelElementCollection>
+        </submodelElements>
+      </submodel>
+    `
+    const result = parseCapabilitySubmodel(getRoot(xml))
+    expect(result.capabilities).toHaveLength(2)
+    expect(result.capabilities[0].containerIdShort).toBe('Cap1')
+    expect(result.capabilities[1].containerIdShort).toBe('Cap2')
+  })
+})
+
+describe('parseCapabilitySubmodel — ConstraintHasProperty', () => {
+  it('resolves constrainedPropertyIdShort from ConstraintHasProperty second element', () => {
+    const xml = `
+      <submodel xmlns="${AAS_NS}">
+        <id>urn:example:sm:constraints</id>
+        <submodelElements>
+          <submodelElementCollection>
+            <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
+            <value>
+              <submodelElementCollection>
+                <idShort>WeldingProcess</idShort>
+                <value>
+                  <capability><idShort>WeldingProcess</idShort></capability>
+                  <submodelElementCollection>
+                    <idShort>CapabilityRelations</idShort>
+                    <value>
+                      <submodelElementCollection>
+                        <idShort>ConstraintSet</idShort>
+                        <value>
+                          <submodelElementCollection>
+                            <idShort>PowerConstraint</idShort>
+                            <value>
+                              <property>
+                                <idShort>ConstraintType</idShort>
+                                <value>BasicConstraint</value>
+                              </property>
+                              <property>
+                                <idShort>BasicConstraint</idShort>
+                                <value>PowerRange &gt; 500</value>
+                              </property>
+                              <submodelElementCollection>
+                                <idShort>ConstraintPropertyRelations</idShort>
+                                <value>
+                                  <relationshipElement>
+                                    <idShort>ConstraintHasProperty</idShort>
+                                    <first>
+                                      <keys>
+                                        <key>
+                                          <type>Property</type>
+                                          <value>PowerConstraint</value>
+                                        </key>
+                                      </keys>
+                                    </first>
+                                    <second>
+                                      <keys>
+                                        <key>
+                                          <type>Property</type>
+                                          <value>PowerRange</value>
+                                        </key>
+                                      </keys>
+                                    </second>
+                                  </relationshipElement>
+                                </value>
+                              </submodelElementCollection>
+                            </value>
+                          </submodelElementCollection>
+                        </value>
+                      </submodelElementCollection>
+                    </value>
+                  </submodelElementCollection>
+                </value>
+              </submodelElementCollection>
+            </value>
+          </submodelElementCollection>
+        </submodelElements>
+      </submodel>
+    `
+    const result = parseCapabilitySubmodel(getRoot(xml))
+    expect(result.capabilities).toHaveLength(1)
+    expect(result.capabilities[0].constraints).toHaveLength(1)
+    const constraint = result.capabilities[0].constraints[0]
+    expect(constraint.idShort).toBe('PowerConstraint')
+    expect(constraint.constraintType).toBe('BasicConstraint')
+    expect(constraint.value).toBe('PowerRange > 500')
+    expect(constraint.constrainedPropertyIdShort).toBe('PowerRange')
+  })
+})
+
 describe('parseCapabilitySubmodel edge cases', () => {
   it('returns 0 capabilities for an empty CapabilitySet', () => {
     const xml = `
@@ -241,6 +379,7 @@ describe('parseCapabilitySubmodel edge cases', () => {
         <submodelElements>
           <submodelElementCollection>
             <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
             <value></value>
           </submodelElementCollection>
         </submodelElements>
@@ -258,6 +397,7 @@ describe('parseCapabilitySubmodel edge cases', () => {
         <submodelElements>
           <submodelElementCollection>
             <idShort>CapabilitySet</idShort>
+            ${CAP_SET_SEMANTIC_XML}
             <value>
               <submodelElementCollection>
                 <idShort>MinimalCapability</idShort>

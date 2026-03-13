@@ -3,6 +3,8 @@
  * Extracted from aas-editor.tsx for testability and reuse.
  */
 
+import { CAPABILITY_SEMANTIC_IDS, DEFAULT_ROLE_QUALIFIERS, type AASQualifier } from '@/lib/types/capability'
+
 export type SubmodelElementModelType =
   | "Property"
   | "MultiLanguageProperty"
@@ -42,6 +44,7 @@ export interface SubmodelElement {
   inputVariables?: any[]
   outputVariables?: any[]
   inoutputVariables?: any[]
+  qualifiers?: AASQualifier[]
 }
 
 export interface CreateElementParams {
@@ -57,17 +60,23 @@ export interface CreateElementParams {
 /** The 4 inner elements of a CapabilityName container */
 function capabilityInnerChildren(capabilityIdShort: string): SubmodelElement[] {
   return [
-    { idShort: capabilityIdShort, modelType: "Capability", cardinality: "One", description: "The capability element" },
-    { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability", value: { en: "" } },
+    {
+      idShort: capabilityIdShort,
+      modelType: "Capability",
+      cardinality: "One",
+      description: "The capability element",
+      qualifiers: DEFAULT_ROLE_QUALIFIERS.map(q => ({ ...q })),
+    },
+    { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability" },
     {
       idShort: "PropertySet", modelType: "SubmodelElementCollection", cardinality: "ZeroToMany",
       description: "Set of properties for this capability",
-      semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/PropertySet", children: [],
+      semanticId: CAPABILITY_SEMANTIC_IDS.PropertySet, children: [],
     },
     {
       idShort: "CapabilityRelations", modelType: "SubmodelElementCollection", cardinality: "ZeroToOne",
       description: "Relations and constraints",
-      semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilityRelations", children: [],
+      semanticId: CAPABILITY_SEMANTIC_IDS.CapabilityRelations, children: [],
     },
   ]
 }
@@ -85,7 +94,7 @@ function capabilityNameContainer(capabilityIdShort: string): SubmodelElement {
 
 /**
  * Creates a new SubmodelElement based on the given type and parameters.
- * Handles CapabilitySet and CapabilityContainer pseudo-types.
+ * Handles CapabilityName pseudo-type.
  */
 export function createElement(params: CreateElementParams): SubmodelElement {
   const { type, idShort, cardinality, description, semanticId, valueType, entityType } = params
@@ -129,7 +138,7 @@ export function createElement(params: CreateElementParams): SubmodelElement {
     case "Entity":
       return { ...base, entityType: entityType || "CoManagedEntity", children: [] }
     case "Capability":
-      return { ...base }
+      return { ...base, qualifiers: DEFAULT_ROLE_QUALIFIERS.map(q => ({ ...q })) }
     case "Operation":
       return { ...base, inputVariables: [], outputVariables: [], inoutputVariables: [] }
     case "BasicEventElement":
@@ -150,12 +159,65 @@ export function generateCapabilityTemplateStructure(): SubmodelElement[] {
     {
       idShort: "CapabilitySet",
       modelType: "SubmodelElementCollection",
-      cardinality: "One",
+      cardinality: "OneToMany",
       description: "Set of capabilities",
-      semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilitySet",
+      semanticId: CAPABILITY_SEMANTIC_IDS.CapabilitySet,
       children: [capabilityNameContainer("Capability1")],
     },
   ]
+}
+
+/** Creates a PropertyConstraintContainer with ConstraintPropertyRelations */
+export function createPropertyConstraintContainer(params: {
+  idShort: string
+  constraintType: 'BasicConstraint' | 'CustomConstraint' | 'OCLConstraint' | 'OperationConstraint'
+  value: string
+  conditionalType: string
+  targetPropertyPath: string
+  constraintElementPath: string
+}): SubmodelElement {
+  return {
+    idShort: params.idShort,
+    modelType: "SubmodelElementCollection",
+    semanticId: CAPABILITY_SEMANTIC_IDS.PropertyConstraintContainer,
+    children: [
+      {
+        idShort: params.constraintType,
+        modelType: "Property",
+        valueType: "xs:string",
+        value: params.value,
+        semanticId: `https://admin-shell.io/idta/CapabilityDescription/PropertyConstraintType/${params.constraintType}/1/0`,
+      },
+      {
+        idShort: "ConstraintType",
+        modelType: "Property",
+        valueType: "xs:string",
+        value: params.constraintType,
+        semanticId: CAPABILITY_SEMANTIC_IDS.ConstraintType,
+      },
+      {
+        idShort: "PropertyConditionalType",
+        modelType: "Property",
+        valueType: "xs:string",
+        value: params.conditionalType,
+        semanticId: CAPABILITY_SEMANTIC_IDS.PropertyConditionalType,
+      },
+      {
+        idShort: "ConstraintPropertyRelations",
+        modelType: "SubmodelElementCollection",
+        semanticId: CAPABILITY_SEMANTIC_IDS.ConstraintPropertyRelations,
+        children: [
+          {
+            idShort: "ConstraintHasProperty",
+            modelType: "RelationshipElement",
+            semanticId: CAPABILITY_SEMANTIC_IDS.ConstraintHasProperty,
+            first: { type: "ModelReference", keys: [{ type: "Property", value: params.constraintElementPath }] },
+            second: { type: "ModelReference", keys: [{ type: "Property", value: params.targetPropertyPath }] },
+          },
+        ],
+      },
+    ],
+  }
 }
 
 /** All available element types for the Add Element dialog */

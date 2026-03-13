@@ -744,24 +744,50 @@ export default function VisualizerPage() {
     }
     // Track as recently opened
     trackRecentFile(index)
-    const shell = env.assetAdministrationShells[0]
+    const allShells = env.assetAdministrationShells
+    const shell = allShells[0]
     const submodels = Array.isArray(env.submodels) ? env.submodels : []
-    const selectedSubmodels = submodels.map((sm: any) => ({
-      idShort: sm.idShort || `Submodel`,
-      template: {
-        name: sm.idShort || `Submodel`,
-        version: "1.0",
-        description: "Imported submodel",
-        url: sm.semanticId?.keys?.[0]?.value || `https://admin-shell.io/submodels/${sm.idShort || 'submodel'}`
+    // Deduplicate idShorts: when multiple submodels share the same idShort,
+    // append a suffix so each has a unique key for submodelData
+    const idShortCounts: Record<string, number> = {}
+    const selectedSubmodels = submodels.map((sm: any) => {
+      const base = sm.idShort || 'Submodel'
+      idShortCounts[base] = (idShortCounts[base] || 0) + 1
+      const uniqueIdShort = idShortCounts[base] > 1 ? `${base}_${idShortCounts[base]}` : base
+      return {
+        idShort: uniqueIdShort,
+        submodelId: sm.id || undefined, // unique URI for shell mapping
+        template: {
+          name: sm.idShort || `Submodel`,
+          version: "1.0",
+          description: "Imported submodel",
+          url: sm.semanticId?.keys?.[0]?.value || `https://admin-shell.io/submodels/${sm.idShort || 'submodel'}`
+        }
       }
-    }))
-    
+    })
+
+    // Build shells array with submodel mappings using unique submodel IDs
+    const shells = allShells.map((s: any) => {
+      const refs: string[] = s.submodelRefs || []
+      const submodelIds = refs.length > 0
+        ? refs
+        : (allShells.length === 1 ? submodels.map((sm: any) => sm.id).filter(Boolean) : [])
+      return {
+        idShort: s.idShort || "ImportedAAS",
+        id: s.id || "https://example.com/aas/imported",
+        assetKind: s.assetKind || "Instance",
+        globalAssetId: s.globalAssetId || "",
+        submodelIds,
+      }
+    })
+
     const cfg = {
       idShort: shell.idShort || "ImportedAAS",
       id: shell.id || "https://example.com/aas/imported",
       assetKind: shell.assetKind || "Instance",
       globalAssetId: shell.globalAssetId || "",
-      selectedSubmodels
+      selectedSubmodels,
+      shells,
     }
     
     const mapDescription = (desc: any): string | undefined => {
@@ -826,9 +852,11 @@ export default function VisualizerPage() {
       return base
     }
     const initial: Record<string, any[]> = {}
-    submodels.forEach((sm: any) => {
+    selectedSubmodels.forEach((sel: any, idx: number) => {
+      const sm = submodels[idx]
+      if (!sm) return
       const elements = Array.isArray(sm.submodelElements) ? sm.submodelElements.map(mapElement) : []
-      initial[sm.idShort || "Submodel"] = elements
+      initial[sel.idShort] = elements
     })
     setCurrentAASConfig(cfg)
     setInitialSubmodelData(initial)

@@ -4,6 +4,7 @@ import {
   ALL_ELEMENT_TYPES,
   type CreateElementParams,
 } from '@/lib/element-factory'
+import { CAPABILITY_SEMANTIC_IDS, DEFAULT_ROLE_QUALIFIERS } from '@/lib/types/capability'
 
 // ─── CapabilityName creation (Add Element) ──────────────────────────────
 
@@ -48,30 +49,55 @@ describe('createElement — CapabilityName', () => {
     expect(el.children![0].cardinality).toBe('One')
   })
 
-  it('second child is CapabilityComment MLP with cardinality ZeroToOne', () => {
+  it('first child (Capability) has all 3 role qualifiers', () => {
+    const el = createElement(params)
+    const cap = el.children![0]
+    expect(cap.qualifiers).toHaveLength(3)
+    expect(cap.qualifiers![0].type).toBe('CapabilityRoleQualifier/Offered')
+    expect(cap.qualifiers![0].value).toBe('false')
+    expect(cap.qualifiers![1].type).toBe('CapabilityRoleQualifier/Required')
+    expect(cap.qualifiers![1].value).toBe('false')
+    expect(cap.qualifiers![2].type).toBe('CapabilityRoleQualifier/NotAssigned')
+    expect(cap.qualifiers![2].value).toBe('true')
+  })
+
+  it('role qualifiers have correct semanticIds with version after element name', () => {
+    const el = createElement(params)
+    const qualifiers = el.children![0].qualifiers!
+    expect(qualifiers[0].semanticId).toContain('CapabilityRoleQualifier/Offered/1/0')
+    expect(qualifiers[1].semanticId).toContain('CapabilityRoleQualifier/Required/1/0')
+    expect(qualifiers[2].semanticId).toContain('CapabilityRoleQualifier/NotAssigned/1/0')
+  })
+
+  it('second child is CapabilityComment MLP with cardinality ZeroToOne and no default value', () => {
     const el = createElement(params)
     expect(el.children![1].modelType).toBe('MultiLanguageProperty')
     expect(el.children![1].idShort).toBe('CapabilityComment')
     expect(el.children![1].cardinality).toBe('ZeroToOne')
-    expect(el.children![1].value).toEqual({ en: '' })
+    expect(el.children![1].value).toBeUndefined()
   })
 
-  it('third child is PropertySet SMC with cardinality ZeroToMany', () => {
+  it('third child is PropertySet SMC with cardinality ZeroToMany and correct semanticId', () => {
     const el = createElement(params)
     expect(el.children![2].modelType).toBe('SubmodelElementCollection')
     expect(el.children![2].idShort).toBe('PropertySet')
     expect(el.children![2].cardinality).toBe('ZeroToMany')
-    expect(el.children![2].semanticId).toContain('PropertySet')
+    expect(el.children![2].semanticId).toBe(CAPABILITY_SEMANTIC_IDS.PropertySet)
     expect(el.children![2].children).toEqual([])
   })
 
-  it('fourth child is CapabilityRelations SMC with cardinality ZeroToOne', () => {
+  it('fourth child is CapabilityRelations SMC with cardinality ZeroToOne and correct semanticId', () => {
     const el = createElement(params)
     expect(el.children![3].modelType).toBe('SubmodelElementCollection')
     expect(el.children![3].idShort).toBe('CapabilityRelations')
     expect(el.children![3].cardinality).toBe('ZeroToOne')
-    expect(el.children![3].semanticId).toContain('CapabilityRelations')
-    expect(el.children![3].children).toEqual([])
+    expect(el.children![3].semanticId).toBe(CAPABILITY_SEMANTIC_IDS.CapabilityRelations)
+  })
+
+  it('CapabilityRelations starts with empty children (ConstraintSet created on demand)', () => {
+    const el = createElement(params)
+    const relations = el.children![3]
+    expect(relations.children).toEqual([])
   })
 
   it('respects custom idShort', () => {
@@ -82,6 +108,83 @@ describe('createElement — CapabilityName', () => {
   it('respects custom semanticId', () => {
     const el = createElement({ ...params, semanticId: 'urn:custom:id' })
     expect(el.semanticId).toBe('urn:custom:id')
+  })
+})
+
+// ─── Semantic ID path format ────────────────────────────────────────────
+
+describe('Semantic ID path format', () => {
+  it('CapabilitySet uses version after element name: .../CapabilitySet/1/0', () => {
+    expect(CAPABILITY_SEMANTIC_IDS.CapabilitySet).toBe(
+      'https://admin-shell.io/idta/CapabilityDescription/CapabilitySet/1/0'
+    )
+  })
+
+  it('PropertySet uses version after element name: .../PropertySet/1/0', () => {
+    expect(CAPABILITY_SEMANTIC_IDS.PropertySet).toBe(
+      'https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0'
+    )
+  })
+
+  it('CapabilityRelations uses version after element name: .../CapabilityRelations/1/0', () => {
+    expect(CAPABILITY_SEMANTIC_IDS.CapabilityRelations).toBe(
+      'https://admin-shell.io/idta/CapabilityDescription/CapabilityRelations/1/0'
+    )
+  })
+
+  it('ConstraintSet uses version after element name: .../ConstraintSet/1/0', () => {
+    expect(CAPABILITY_SEMANTIC_IDS.ConstraintSet).toBe(
+      'https://admin-shell.io/idta/CapabilityDescription/ConstraintSet/1/0'
+    )
+  })
+
+  it('Submodel semantic ID uses canonical format: .../1/0/Submodel', () => {
+    expect(CAPABILITY_SEMANTIC_IDS.Submodel).toBe(
+      'https://admin-shell.io/idta/CapabilityDescription/1/0/Submodel'
+    )
+  })
+})
+
+// ─── Role qualifiers ────────────────────────────────────────────────────
+
+describe('DEFAULT_ROLE_QUALIFIERS', () => {
+  it('has exactly 3 qualifiers', () => {
+    expect(DEFAULT_ROLE_QUALIFIERS).toHaveLength(3)
+  })
+
+  it('exactly one qualifier has value "true" (NotAssigned)', () => {
+    const trueQualifiers = DEFAULT_ROLE_QUALIFIERS.filter(q => q.value === 'true')
+    expect(trueQualifiers).toHaveLength(1)
+    expect(trueQualifiers[0].type).toContain('NotAssigned')
+  })
+
+  it('all qualifiers have valueType xs:boolean', () => {
+    for (const q of DEFAULT_ROLE_QUALIFIERS) {
+      expect(q.valueType).toBe('xs:boolean')
+    }
+  })
+
+  it('all qualifiers have semanticIds', () => {
+    for (const q of DEFAULT_ROLE_QUALIFIERS) {
+      expect(q.semanticId).toBeTruthy()
+    }
+  })
+})
+
+// ─── Standalone Capability element gets qualifiers too ──────────────────
+
+describe('createElement — standalone Capability', () => {
+  it('injects 3 role qualifiers on bare Capability', () => {
+    const el = createElement({
+      type: 'Capability',
+      idShort: 'TestCap',
+      cardinality: 'One',
+      description: '',
+      semanticId: '',
+    })
+    expect(el.qualifiers).toHaveLength(3)
+    expect(el.qualifiers![2].type).toContain('NotAssigned')
+    expect(el.qualifiers![2].value).toBe('true')
   })
 })
 
@@ -146,12 +249,6 @@ describe('createElement — standard types', () => {
     expect(el.children).toEqual([])
   })
 
-  it('Capability has no value or children', () => {
-    const el = createElement({ ...base, type: 'Capability' })
-    expect(el.value).toBeUndefined()
-    expect(el.children).toBeUndefined()
-  })
-
   it('Operation has input/output arrays', () => {
     const el = createElement({ ...base, type: 'Operation' })
     expect(el.inputVariables).toEqual([])
@@ -186,6 +283,16 @@ describe('generateCapabilityTemplateStructure', () => {
     expect(result[0].idShort).toBe('CapabilitySet')
   })
 
+  it('CapabilitySet has cardinality OneToMany (1..*)', () => {
+    const result = generateCapabilityTemplateStructure()
+    expect(result[0].cardinality).toBe('OneToMany')
+  })
+
+  it('CapabilitySet has correct semanticId with version after element name', () => {
+    const result = generateCapabilityTemplateStructure()
+    expect(result[0].semanticId).toBe(CAPABILITY_SEMANTIC_IDS.CapabilitySet)
+  })
+
   it('CapabilitySet has one child: CapabilityName SMC', () => {
     const result = generateCapabilityTemplateStructure()
     expect(result[0].children).toHaveLength(1)
@@ -199,19 +306,25 @@ describe('generateCapabilityTemplateStructure', () => {
     expect(capName.children).toHaveLength(4)
   })
 
-  it('CapabilitySet has correct semanticId', () => {
-    const result = generateCapabilityTemplateStructure()
-    expect(result[0].semanticId).toBe(
-      'https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilitySet'
-    )
+  it('inner Capability has 3 role qualifiers', () => {
+    const inner = generateCapabilityTemplateStructure()[0].children![0].children!
+    expect(inner[0].qualifiers).toHaveLength(3)
   })
 
-  it('inner children have correct cardinalities', () => {
+  it('inner PropertySet uses correct semanticId path', () => {
     const inner = generateCapabilityTemplateStructure()[0].children![0].children!
-    expect(inner[0].cardinality).toBe('One')        // Capability
-    expect(inner[1].cardinality).toBe('ZeroToOne')   // CapabilityComment
-    expect(inner[2].cardinality).toBe('ZeroToMany')  // PropertySet
-    expect(inner[3].cardinality).toBe('ZeroToOne')   // CapabilityRelations
+    expect(inner[2].semanticId).toBe(CAPABILITY_SEMANTIC_IDS.PropertySet)
+  })
+
+  it('inner CapabilityRelations uses correct semanticId path', () => {
+    const inner = generateCapabilityTemplateStructure()[0].children![0].children!
+    expect(inner[3].semanticId).toBe(CAPABILITY_SEMANTIC_IDS.CapabilityRelations)
+  })
+
+  it('inner CapabilityRelations starts empty (ConstraintSet created on demand)', () => {
+    const inner = generateCapabilityTemplateStructure()[0].children![0].children!
+    const relations = inner[3]
+    expect(relations.children).toEqual([])
   })
 
   it('inner children match expected types', () => {

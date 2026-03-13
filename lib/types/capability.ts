@@ -1,5 +1,49 @@
 export type CapabilityRole = 'Offered' | 'Required' | 'NotAssigned'
 
+/** Canonical IDTA CapabilityDescription semantic IDs (version segment after element name) */
+export const CAPABILITY_SEMANTIC_IDS = {
+  Submodel: 'https://admin-shell.io/idta/CapabilityDescription/1/0/Submodel',
+  CapabilitySet: 'https://admin-shell.io/idta/CapabilityDescription/CapabilitySet/1/0',
+  PropertySet: 'https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0',
+  CapabilityRelations: 'https://admin-shell.io/idta/CapabilityDescription/CapabilityRelations/1/0',
+  ConstraintSet: 'https://admin-shell.io/idta/CapabilityDescription/ConstraintSet/1/0',
+  PropertyConstraintContainer: 'https://admin-shell.io/idta/CapabilityDescription/PropertyConstraintContainer/1/0',
+  ConstraintType: 'https://admin-shell.io/idta/CapabilityDescription/ConstraintType/1/0',
+  PropertyConditionalType: 'https://admin-shell.io/idta/CapabilityDescription/PropertyConditionalType/1/0',
+  ConstraintPropertyRelations: 'https://admin-shell.io/idta/CapabilityDescription/ConstraintPropertyRelations/1/0',
+  ConstraintHasProperty: 'https://admin-shell.io/idta/CapabilityDescription/ConstraintHasProperty/1/0',
+} as const
+
+/** Qualifier structure for AAS elements */
+export interface AASQualifier {
+  type: string
+  valueType: string
+  value: string
+  semanticId?: string
+}
+
+/** The 3 role qualifiers that MUST be present on every Capability element (exactly one true) */
+export const DEFAULT_ROLE_QUALIFIERS: AASQualifier[] = [
+  {
+    type: 'CapabilityRoleQualifier/Offered',
+    valueType: 'xs:boolean',
+    value: 'false',
+    semanticId: 'https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Offered/1/0',
+  },
+  {
+    type: 'CapabilityRoleQualifier/Required',
+    valueType: 'xs:boolean',
+    value: 'false',
+    semanticId: 'https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Required/1/0',
+  },
+  {
+    type: 'CapabilityRoleQualifier/NotAssigned',
+    valueType: 'xs:boolean',
+    value: 'true',
+    semanticId: 'https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/NotAssigned/1/0',
+  },
+]
+
 export interface ParsedPropertyValue {
   type: 'single' | 'range' | 'list'
   value?: string
@@ -21,6 +65,8 @@ export interface ParsedCapabilityConstraint {
   constraintType: 'BasicConstraint' | 'CustomConstraint' | 'OCLConstraint' | 'OperationConstraint'
   value?: string
   conditionalType?: string
+  /** Resolved from ConstraintHasProperty relationship second element */
+  constrainedPropertyIdShort?: string
 }
 
 export interface ParsedCapability {

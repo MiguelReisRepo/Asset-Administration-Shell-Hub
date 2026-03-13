@@ -160,6 +160,15 @@ interface SubmodelTemplate {
 interface SelectedSubmodel {
   template: SubmodelTemplate
   idShort: string
+  submodelId?: string // unique submodel ID (URI) for multi-AAS dedup
+}
+
+interface AASShell {
+  idShort: string
+  id: string
+  assetKind: "Instance" | "Type"
+  globalAssetId: string
+  submodelIds: string[] // unique submodel IDs that belong to this shell
 }
 
 interface AASConfig {
@@ -168,6 +177,7 @@ interface AASConfig {
   assetKind: "Instance" | "Type" // Added assetKind
   globalAssetId: string // Added globalAssetId
   selectedSubmodels: SelectedSubmodel[]
+  shells?: AASShell[] // multiple shells (optional for backward compat)
 }
 
 // All supported AAS SubmodelElement types
@@ -213,6 +223,8 @@ interface SubmodelElement {
   // ReferenceElement and relationships
   first?: any // for RelationshipElement
   second?: any // for RelationshipElement
+  // Qualifiers (e.g. CapabilityRoleQualifiers)
+  qualifiers?: Array<{ type: string; valueType: string; value: string; semanticId?: string }>
 }
 
 interface AASEditorProps {
@@ -244,6 +256,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
   const [selectedSubmodel, setSelectedSubmodel] = useState<SelectedSubmodel | null>(
     aasConfig.selectedSubmodels[0] || null
   )
+  const [selectedShellIndex, setSelectedShellIndex] = useState<number | null>(0)
   const [selectedElement, setSelectedElement] = useState<SubmodelElement | null>(null)
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const [showAddSubmodel, setShowAddSubmodel] = useState(false)
@@ -854,11 +867,12 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
     return "ZeroToOne"
   }
 
-  function generateTemplateStructure(templateName: string): SubmodelElement[] {
-    // Note: This is called synchronously, so we use the hardcoded structure
-    // The real fetch would need to happen at template selection time
-    
-    if (templateName.includes("Digital") || templateName.includes("Nameplate")) {
+  function generateTemplateStructure(templateName: string, templateUrl?: string): SubmodelElement[] {
+    // Match by semantic ID (url) first, fall back to exact name match
+    const matchUrl = (url: string) => templateUrl === url
+    const matchName = (...names: string[]) => names.includes(templateName)
+
+    if (matchUrl('https://admin-shell.io/zvei/nameplate/2/0/Nameplate') || matchName("Digital Nameplate", "Nameplate")) {
       return [
         { idShort: "URIOfTheProduct", modelType: "Property", valueType: "string", value: "", cardinality: "ZeroToOne", description: "Unique global identification of the product using a universal resource identifier (URI)", semanticId: "0173-1#02-AAY811#001" },
         { idShort: "ManufacturerName", modelType: "MultiLanguageProperty", value: { en: "" }, cardinality: "One", description: "legally valid designation of the natural or judicial person which is directly responsible for the design, production, packaging and labeling of a product in respect to its being brought into circulation", semanticId: "0173-1#02-AAO677#002" },
@@ -922,7 +936,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       ]
     }
     
-    if (templateName.includes("Contact")) {
+    if (matchUrl('https://admin-shell.io/zvei/contact/1/0/Contact') || matchName("Contact Information", "Contact")) {
       return [
         { idShort: "RoleOfContactPerson", modelType: "Property", valueType: "string", value: "", cardinality: "One", description: "Role of contact person", semanticId: "https://admin-shell.io/zvei/contact/1/0/Contact/RoleOfContactPerson" },
         { idShort: "NameOfContact", modelType: "MultiLanguageProperty", value: { en: "" }, cardinality: "One", description: "Name of contact", semanticId: "https://admin-shell.io/zvei/contact/1/0/Contact/NameOfContact" },
@@ -935,7 +949,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       ]
     }
     
-    if (templateName.includes("Technical") || templateName.includes("Data")) {
+    if (matchUrl('https://admin-shell.io/ZVEI/TechnicalData/Submodel/1/2') || matchName("TechnicalData", "Technical Data")) {
       return [
         { idShort: "GeneralInformation", modelType: "SubmodelElementCollection", cardinality: "One", description: "General technical information",
           semanticId: "https://admin-shell.io/zvei/technicaldatacollection/1/0/TechnicalDataCollection/GeneralInformation",
@@ -955,7 +969,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       ]
     }
     
-    if (templateName.includes("Carbon") || templateName.includes("Footprint")) {
+    if (matchUrl('https://admin-shell.io/idta/CarbonFootprint/CarbonFootprint/0/9') || matchName("CarbonFootprint", "Carbon Footprint")) {
       return [
         { idShort: "PCF", modelType: "SubmodelElementCollection", cardinality: "One", description: "Product Carbon Footprint",
           semanticId: "https://admin-shell.io/zvei/carbonfootprint/1/0/ProductCarbonFootprint/PCF",
@@ -968,19 +982,24 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       ]
     }
     
-    if (templateName.includes("Capability") || templateName.includes("CapabilityDescription")) {
+    if (matchUrl('https://admin-shell.io/idta/CapabilityDescription/1/0/Submodel') || matchName("CapabilityDescription", "Capability Description")) {
       return [
-        { idShort: "CapabilitySet", modelType: "SubmodelElementCollection", cardinality: "One", description: "Set of capabilities",
-          semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilitySet",
+        { idShort: "CapabilitySet", modelType: "SubmodelElementCollection", cardinality: "OneToMany", description: "Set of capabilities",
+          semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilitySet/1/0",
           children: [
             { idShort: "CapabilityName", modelType: "SubmodelElementCollection", cardinality: "One", description: "A named capability container",
               children: [
-                { idShort: "Capability1", modelType: "Capability", cardinality: "One", description: "The capability element" },
-                { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability", value: { en: "" } },
+                { idShort: "Capability1", modelType: "Capability", cardinality: "One", description: "The capability element",
+                  qualifiers: [
+                    { type: "CapabilityRoleQualifier/Offered", valueType: "xs:boolean", value: "false", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Offered/1/0" },
+                    { type: "CapabilityRoleQualifier/Required", valueType: "xs:boolean", value: "false", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Required/1/0" },
+                    { type: "CapabilityRoleQualifier/NotAssigned", valueType: "xs:boolean", value: "true", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/NotAssigned/1/0" },
+                  ] },
+                { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability" },
                 { idShort: "PropertySet", modelType: "SubmodelElementCollection", cardinality: "ZeroToMany", description: "Set of properties for this capability",
-                  semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/PropertySet", children: [] },
+                  semanticId: "https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0", children: [] },
                 { idShort: "CapabilityRelations", modelType: "SubmodelElementCollection", cardinality: "ZeroToOne", description: "Relations and constraints",
-                  semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilityRelations", children: [] },
+                  semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRelations/1/0", children: [] },
               ]
             },
           ]
@@ -988,7 +1007,7 @@ export function AASEditor({ aasConfig, onBack, onFileGenerated, onUpdateAASConfi
       ]
     }
 
-    if (templateName.includes("Handover")) {
+    if (matchUrl('https://admin-shell.io/zvei/handover/1/0/HandoverDocumentation') || matchName("HandoverDocumentation", "Handover Documentation")) {
       return [
         { idShort: "HandoverDocumentation", modelType: "SubmodelElementCollection", cardinality: "One", description: "Handover documentation",
           semanticId: "https://admin-shell.io/zvei/handover/1/0/HandoverDocumentation/HandoverDocumentation",
@@ -2639,6 +2658,7 @@ ${conceptXml}
       typeKey === "submodelelementlist" ? "submodelElementList" :
       typeKey === "file" ? "file" :
       typeKey === "referenceelement" ? "referenceElement" :
+      typeKey === "capability" ? "capability" :
       "property";
 
     const isReference = tagName === "referenceElement";
@@ -2711,6 +2731,30 @@ ${conceptXml}
         xml += `${indent}    </keys>\n`;
         xml += `${indent}  </semanticId>\n`;
       }
+    }
+
+    // Qualifiers (e.g. CapabilityRoleQualifiers) - MUST come after semanticId per AAS 3.1 schema
+    if (Array.isArray(element.qualifiers) && element.qualifiers.length > 0) {
+      xml += `${indent}  <qualifiers>\n`;
+      for (const q of element.qualifiers) {
+        xml += `${indent}    <qualifier>\n`;
+        if (q.semanticId) {
+          xml += `${indent}      <semanticId>\n`;
+          xml += `${indent}        <type>ExternalReference</type>\n`;
+          xml += `${indent}        <keys>\n`;
+          xml += `${indent}          <key>\n`;
+          xml += `${indent}            <type>GlobalReference</type>\n`;
+          xml += `${indent}            <value>${escapeXml(q.semanticId)}</value>\n`;
+          xml += `${indent}          </key>\n`;
+          xml += `${indent}        </keys>\n`;
+          xml += `${indent}      </semanticId>\n`;
+        }
+        xml += `${indent}      <type>${escapeXml(q.type)}</type>\n`;
+        xml += `${indent}      <valueType>${escapeXml(q.valueType)}</valueType>\n`;
+        xml += `${indent}      <value>${escapeXml(q.value)}</value>\n`;
+        xml += `${indent}    </qualifier>\n`;
+      }
+      xml += `${indent}  </qualifiers>\n`;
     }
 
     // embeddedDataSpecifications (IEC 61360) - MUST come before type-specific content per AAS 3.1 schema
@@ -2834,6 +2878,8 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         }
         xml += `${indent}  </value>\n`;
       }
+    } else if (tagName === "capability") {
+      // Capability has no type-specific content (qualifiers already serialized above)
     } else if (tagName === "referenceElement") {
       // ReferenceElement: only value is allowed (no semanticId, no embeddedDataSpecifications)
       const v: any = element.value;
@@ -3409,12 +3455,22 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
           }
         }
         
+        // Warn when PropertySet has no property containers
+        if (element.idShort === "PropertySet" && element.modelType === "SubmodelElementCollection" && (!element.children || element.children.length === 0)) {
+          missingFields.push(`${submodelId} > ${currentPath.join(' > ')} (PropertySet should contain at least one property container)`)
+          errors.add(nodeId)
+          for (let i = 0; i < currentPath.length - 1; i++) {
+            const parentPath = currentPath.slice(0, i + 1).join('.')
+            nodesToExpand.add(parentPath)
+          }
+        }
+
         if (element.children && element.children.length > 0) {
           validateElements(element.children, submodelId, currentPath)
         }
       })
     }
-    
+
     aasConfig.selectedSubmodels.forEach(sm => {
       const elements = submodelData[sm.idShort] || []
       validateElements(elements, sm.idShort)
@@ -3436,7 +3492,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     }
 
     const fetchedStructure = await fetchTemplateDetails(template.name)
-    const structure = fetchedStructure || generateTemplateStructure(template.name)
+    const structure = fetchedStructure || generateTemplateStructure(template.name, template.url)
     
     // Create a new AASConfig object with the updated selectedSubmodels array
     const updatedSelectedSubmodels = [...aasConfig.selectedSubmodels, newSubmodel];
@@ -3549,12 +3605,17 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
         description: newElementDescription.trim() || "A named capability container",
         semanticId: newElementSemanticId.trim() || undefined,
         children: [
-          { idShort: "Capability1", modelType: "Capability", cardinality: "One", description: "The capability element" },
-          { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability", value: { en: "" } },
+          { idShort: "Capability1", modelType: "Capability", cardinality: "One", description: "The capability element",
+            qualifiers: [
+              { type: "CapabilityRoleQualifier/Offered", valueType: "xs:boolean", value: "false", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Offered/1/0" },
+              { type: "CapabilityRoleQualifier/Required", valueType: "xs:boolean", value: "false", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/Required/1/0" },
+              { type: "CapabilityRoleQualifier/NotAssigned", valueType: "xs:boolean", value: "true", semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRoleQualifier/NotAssigned/1/0" },
+            ] },
+          { idShort: "CapabilityComment", modelType: "MultiLanguageProperty", cardinality: "ZeroToOne", description: "Comment about this capability" },
           { idShort: "PropertySet", modelType: "SubmodelElementCollection", cardinality: "ZeroToMany", description: "Set of properties for this capability",
-            semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/PropertySet", children: [] },
+            semanticId: "https://admin-shell.io/idta/CapabilityDescription/PropertySet/1/0", children: [] },
           { idShort: "CapabilityRelations", modelType: "SubmodelElementCollection", cardinality: "ZeroToOne", description: "Relations and constraints",
-            semanticId: "https://admin-shell.io/idta/CapabilityDescription/1/0/CapabilityRelations", children: [] },
+            semanticId: "https://admin-shell.io/idta/CapabilityDescription/CapabilityRelations/1/0", children: [] },
         ],
       };
     }
@@ -3992,8 +4053,29 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
     }
   };
 
+  // Derive current shell from shells array or fall back to top-level config
+  const currentShell: AASShell | undefined = selectedShellIndex !== null ? aasConfig.shells?.[selectedShellIndex] : undefined
+  const activeIdShort = currentShell?.idShort ?? aasConfig.idShort
+  const activeId = currentShell?.id ?? aasConfig.id
+  const activeAssetKind = currentShell?.assetKind ?? aasConfig.assetKind
+  const activeGlobalAssetId = currentShell?.globalAssetId ?? aasConfig.globalAssetId
+  const hasMultipleShells = (aasConfig.shells?.length ?? 0) > 1
+
+  // Submodels visible for the currently selected shell
+  const activeShellSubmodels = currentShell
+    ? aasConfig.selectedSubmodels.filter(sm => sm.submodelId ? currentShell.submodelIds.includes(sm.submodelId) : currentShell.submodelIds.includes(sm.idShort))
+    : aasConfig.selectedSubmodels
+
   const setAASFieldValue = (field: 'idShort'|'id'|'assetKind'|'globalAssetId', value: string) => {
-    onUpdateAASConfig({ ...aasConfig, [field]: value })
+    if (selectedShellIndex !== null && aasConfig.shells && aasConfig.shells[selectedShellIndex]) {
+      const updatedShells = [...aasConfig.shells]
+      updatedShells[selectedShellIndex] = { ...updatedShells[selectedShellIndex], [field]: value }
+      // Keep top-level in sync with first shell
+      const topLevel = selectedShellIndex === 0 ? { [field]: value } : {}
+      onUpdateAASConfig({ ...aasConfig, ...topLevel, shells: updatedShells })
+    } else {
+      onUpdateAASConfig({ ...aasConfig, [field]: value })
+    }
   }
 
   const copyText = async (label: string, value?: string) => {
@@ -5650,7 +5732,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     <Sparkles className="w-5 h-5 text-white" />
                   </div>
                   <h2 className="text-xl font-bold text-white tracking-tight">
-                    Edit AAS: {aasConfig.idShort}
+                    Edit AAS: {activeIdShort}
                   </h2>
                 </div>
                 <p className="text-white/80 pl-12 text-sm">
@@ -5666,7 +5748,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                 <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">IdShort</div>
                 <div className="flex items-center gap-2">
                   <input
-                    value={aasConfig.idShort || ""}
+                    value={activeIdShort || ""}
                     onChange={(e) => setAASFieldValue('idShort', e.target.value)}
                     className={cn(
                       "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
@@ -5676,7 +5758,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     )}
                   />
                   <button
-                    onClick={() => copyText('IdShort', aasConfig.idShort)}
+                    onClick={() => copyText('IdShort', activeIdShort)}
                     className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
                     title="Copy IdShort"
                   >
@@ -5689,7 +5771,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                 <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">ID</div>
                 <div className="flex items-center gap-2">
                   <input
-                    value={aasConfig.id || ""}
+                    value={activeId || ""}
                     onChange={(e) => setAASFieldValue('id', e.target.value)}
                     className={cn(
                       "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
@@ -5699,7 +5781,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     )}
                   />
                   <button
-                    onClick={() => copyText('ID', aasConfig.id)}
+                    onClick={() => copyText('ID', activeId)}
                     className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
                     title="Copy ID"
                   >
@@ -5712,7 +5794,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                 <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">Asset Kind</div>
                 <div className="flex items-center gap-2">
                   <input
-                    value={aasConfig.assetKind || ""}
+                    value={activeAssetKind || ""}
                     onChange={(e) => setAASFieldValue('assetKind', e.target.value)}
                     className={cn(
                       "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
@@ -5722,7 +5804,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     )}
                   />
                   <button
-                    onClick={() => copyText('Asset Kind', aasConfig.assetKind)}
+                    onClick={() => copyText('Asset Kind', activeAssetKind)}
                     className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
                     title="Copy Asset Kind"
                   >
@@ -5735,7 +5817,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                 <div className="text-[11px] font-semibold text-white/70 uppercase tracking-wide mb-1.5">Global Asset ID</div>
                 <div className="flex items-center gap-2">
                   <input
-                    value={aasConfig.globalAssetId || ""}
+                    value={activeGlobalAssetId || ""}
                     onChange={(e) => setAASFieldValue('globalAssetId', e.target.value)}
                     className={cn(
                       "flex-1 h-9 px-3 rounded-lg text-sm font-medium transition-all",
@@ -5745,7 +5827,7 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     )}
                   />
                   <button
-                    onClick={() => copyText('Global Asset ID', aasConfig.globalAssetId)}
+                    onClick={() => copyText('Global Asset ID', activeGlobalAssetId)}
                     className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
                     title="Copy Global Asset ID"
                   >
@@ -5850,27 +5932,14 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Left Panel - Submodels */}
+        {/* Left Panel - AAS Shells with nested Submodels */}
         <div className="w-72 border-r border-gray-200 dark:border-gray-700 overflow-y-auto bg-gradient-to-b from-[#61caf3]/5 to-[#61caf3]/10">
           <div className="p-4 space-y-3">
-            {/* Section header */}
-            <div className="flex items-center gap-2 mb-4">
-              <Package className="w-5 h-5 text-[#61caf3]" />
-              <h3 className="font-semibold text-gray-800 dark:text-gray-200">Submodels</h3>
-              <span className="ml-auto px-2 py-0.5 bg-[#61caf3]/20 text-[#3a9fd4] text-xs font-medium rounded-full">
-                {aasConfig.selectedSubmodels.length}
-              </span>
-            </div>
-
-            {/* AAS Thumbnail Upload Section */}
-            <div className="mb-4">
-              <label className="flex items-center gap-2 text-xs font-semibold text-gray-600 dark:text-gray-400 mb-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-[#61caf3]" />
-                Thumbnail
-              </label>
+            {/* Thumbnail */}
+            <div className="mb-2">
               {thumbnail ? (
                 <div className="relative group">
-                  <div className="w-full h-[140px] rounded-xl border-2 border-[#61caf3] shadow-lg shadow-[#61caf3]/10 overflow-hidden flex items-center justify-center bg-white">
+                  <div className="w-full h-[100px] rounded-xl border-2 border-[#61caf3] shadow-lg shadow-[#61caf3]/10 overflow-hidden flex items-center justify-center bg-white">
                     <img
                       src={thumbnail || "/placeholder.svg"}
                       alt="AAS Thumbnail"
@@ -5893,83 +5962,142 @@ ${indent}            </langStringShortNameTypeIec61360>\n`
                     onChange={handleThumbnailUpload}
                     className="hidden"
                   />
-                  <div className="w-full h-[140px] rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-[#61caf3] flex flex-col items-center justify-center text-gray-400 hover:text-[#61caf3] bg-white dark:bg-gray-800/50 transition-all hover:shadow-lg hover:shadow-[#61caf3]/10">
-                    <Upload className="w-8 h-8 mb-2" />
-                    <span className="text-xs font-medium">Upload thumbnail</span>
+                  <div className="w-full h-[80px] rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 hover:border-[#61caf3] flex flex-col items-center justify-center text-gray-400 hover:text-[#61caf3] bg-white dark:bg-gray-800/50 transition-all hover:shadow-lg hover:shadow-[#61caf3]/10">
+                    <Upload className="w-6 h-6 mb-1" />
+                    <span className="text-[10px] font-medium">Upload thumbnail</span>
                   </div>
                 </label>
               )}
             </div>
 
-            {/* Add Submodel Button */}
-            <button
-              onClick={() => {
-                loadTemplates()
-                setShowAddSubmodel(true)
-              }}
-              className="w-full p-4 rounded-xl border-2 border-dashed border-[#61caf3]/50 hover:border-[#61caf3] hover:bg-[#61caf3]/10 transition-all flex flex-col items-center gap-2 group"
-            >
-              <div className="w-10 h-10 rounded-full bg-[#61caf3]/20 group-hover:bg-[#61caf3]/30 flex items-center justify-center transition-colors">
-                <Plus className="w-5 h-5 text-[#61caf3]" />
-              </div>
-              <span className="text-xs text-[#61caf3] font-semibold">Add Submodel</span>
-            </button>
-
-            {/* Submodel Cards */}
-            {aasConfig.selectedSubmodels.map((sm, idx) => {
-              const elements = submodelData[sm.idShort] || []
-              const isSelected = selectedSubmodel?.idShort === sm.idShort
+            {/* AAS Shells */}
+            {(aasConfig.shells && aasConfig.shells.length > 0 ? aasConfig.shells : [
+              { idShort: aasConfig.idShort, id: aasConfig.id, assetKind: aasConfig.assetKind, globalAssetId: aasConfig.globalAssetId, submodelIds: aasConfig.selectedSubmodels.map(sm => sm.submodelId || sm.idShort) }
+            ]).map((shell, shellIdx) => {
+              const isShellSelected = selectedShellIndex === shellIdx
+              const shellSubs = aasConfig.selectedSubmodels.filter(sm => sm.submodelId ? shell.submodelIds.includes(sm.submodelId) : shell.submodelIds.includes(sm.idShort))
 
               return (
-                <div
-                  key={idx}
-                  className={cn(
-                    "p-4 rounded-xl cursor-pointer transition-all duration-200 flex flex-col items-center gap-3 relative group border-2",
-                    isSelected
-                      ? "border-[#61caf3] bg-white dark:bg-gray-800 shadow-lg shadow-[#61caf3]/20"
-                      : "border-gray-200 dark:border-gray-700 bg-white/50 dark:bg-gray-800/50 hover:border-[#61caf3]/50 hover:shadow-md"
-                  )}
-                  onClick={() => {
-                    setSelectedSubmodel(sm)
-                    setSelectedElement(null)
-                    setExpandedNodes(new Set())
-                  }}
-                >
+                <div key={shell.id || shellIdx} className="w-full">
+                  {/* Shell header */}
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      removeSubmodel(sm.idShort)
+                    onClick={() => {
+                      if (isShellSelected) {
+                        // Toggle collapse
+                        setSelectedShellIndex(null)
+                      } else {
+                        setSelectedShellIndex(shellIdx)
+                        // Auto-select first submodel if switching shells
+                        if (shellSubs.length > 0) {
+                          setSelectedSubmodel(shellSubs[0])
+                          setSelectedElement(null)
+                          setExpandedNodes(new Set())
+                        }
+                      }
                     }}
-                    className="absolute top-2 right-2 p-1.5 bg-red-500 text-white rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-600 transition-all"
-                    title="Remove submodel"
+                    className={cn(
+                      "w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition-all text-left border-2",
+                      isShellSelected
+                        ? "border-[#61caf3] bg-white dark:bg-gray-800 shadow-md shadow-[#61caf3]/15"
+                        : "border-gray-200 dark:border-gray-700 bg-white/50 dark:bg-gray-800/50 hover:border-[#61caf3]/50"
+                    )}
+                    title={shell.id}
                   >
-                    <X className="w-3 h-3" />
+                    <div className={cn(
+                      "w-8 h-8 rounded-lg flex items-center justify-center shrink-0 text-white",
+                      isShellSelected
+                        ? "bg-gradient-to-br from-[#61caf3] to-[#3a9fd4]"
+                        : "bg-gray-300 dark:bg-gray-600"
+                    )}>
+                      <Package className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className={cn(
+                        "text-xs font-semibold truncate",
+                        isShellSelected ? "text-[#3a9fd4]" : "text-gray-600 dark:text-gray-400"
+                      )}>
+                        {shell.idShort || `AAS ${shellIdx + 1}`}
+                      </div>
+                      <div className="text-[10px] text-gray-400 truncate">
+                        {shellSubs.length} submodel{shellSubs.length !== 1 ? 's' : ''}
+                      </div>
+                    </div>
+                    <ChevronRight className={cn(
+                      "w-3.5 h-3.5 shrink-0 transition-transform",
+                      isShellSelected ? "rotate-90 text-[#61caf3]" : "text-gray-400"
+                    )} />
                   </button>
 
-                  <div
-                    className={cn(
-                      "w-12 h-12 rounded-xl flex items-center justify-center text-white transition-all",
-                      isSelected
-                        ? "bg-gradient-to-br from-[#61caf3] to-[#3a9fd4] shadow-lg shadow-[#61caf3]/30"
-                        : "bg-gray-300 dark:bg-gray-600"
-                    )}
-                  >
-                    <FileText className="w-6 h-6" />
-                  </div>
-                  <div className="text-center">
-                    <span
-                      className={cn(
-                        "text-sm font-semibold block truncate max-w-[180px]",
-                        isSelected ? "text-[#3a9fd4]" : "text-gray-600 dark:text-gray-400"
-                      )}
-                      title={sm.idShort}
-                    >
-                      {sm.idShort}
-                    </span>
-                    <span className="text-[10px] text-gray-400">
-                      {elements.length} elements
-                    </span>
-                  </div>
+                  {/* Nested submodels */}
+                  {isShellSelected && (
+                    <div className="ml-4 mt-1.5 space-y-1.5 border-l-2 border-[#61caf3]/20 pl-3 pb-1">
+                      {shellSubs.map((sm, smIdx) => {
+                        const elements = submodelData[sm.idShort] || []
+                        const isSmSelected = selectedSubmodel?.idShort === sm.idShort
+                        return (
+                          <div
+                            key={smIdx}
+                            className={cn(
+                              "px-3 py-2 rounded-lg cursor-pointer transition-all relative group",
+                              isSmSelected
+                                ? "bg-[#61caf3]/10 border border-[#61caf3]/30"
+                                : "hover:bg-gray-100 dark:hover:bg-gray-800/50 border border-transparent"
+                            )}
+                            onClick={() => {
+                              setSelectedSubmodel(sm)
+                              setSelectedElement(null)
+                              setExpandedNodes(new Set())
+                            }}
+                          >
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                removeSubmodel(sm.idShort)
+                              }}
+                              className="absolute top-1 right-1 p-1 bg-red-500 text-white rounded-md opacity-0 group-hover:opacity-100 hover:bg-red-600 transition-all"
+                              title="Remove submodel"
+                            >
+                              <X className="w-2.5 h-2.5" />
+                            </button>
+                            <div className="flex items-center gap-2">
+                              <div className={cn(
+                                "w-6 h-6 rounded-md flex items-center justify-center shrink-0 text-white",
+                                isSmSelected
+                                  ? "bg-[#61caf3]"
+                                  : "bg-gray-300 dark:bg-gray-600"
+                              )}>
+                                <FileText className="w-3 h-3" />
+                              </div>
+                              <div className="min-w-0">
+                                <div className={cn(
+                                  "text-xs font-medium truncate",
+                                  isSmSelected ? "text-[#3a9fd4]" : "text-gray-600 dark:text-gray-400"
+                                )} title={sm.idShort}>
+                                  {sm.idShort}
+                                </div>
+                                <div className="text-[10px] text-gray-400">
+                                  {elements.length} elements
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {/* Add Submodel Button */}
+                      <button
+                        onClick={() => {
+                          loadTemplates()
+                          setShowAddSubmodel(true)
+                        }}
+                        className="w-full px-3 py-2 rounded-lg border border-dashed border-[#61caf3]/40 hover:border-[#61caf3] hover:bg-[#61caf3]/5 transition-all flex items-center gap-2 group"
+                      >
+                        <div className="w-6 h-6 rounded-md bg-[#61caf3]/15 group-hover:bg-[#61caf3]/25 flex items-center justify-center transition-colors">
+                          <Plus className="w-3 h-3 text-[#61caf3]" />
+                        </div>
+                        <span className="text-[10px] text-[#61caf3] font-semibold">Add Submodel</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
               )
             })}

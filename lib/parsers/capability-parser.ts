@@ -1,10 +1,11 @@
-import type {
-  CapabilityRole,
-  ParsedCapability,
-  ParsedCapabilityConstraint,
-  ParsedCapabilitySubmodel,
-  ParsedPropertyContainer,
-  ParsedPropertyValue,
+import {
+  CAPABILITY_SEMANTIC_IDS,
+  type CapabilityRole,
+  type ParsedCapability,
+  type ParsedCapabilityConstraint,
+  type ParsedCapabilitySubmodel,
+  type ParsedPropertyContainer,
+  type ParsedPropertyValue,
 } from '@/lib/types/capability'
 
 const AAS_NS = 'https://admin-shell.io/aas/3/0'
@@ -76,7 +77,7 @@ function getSupplementalSemanticIdKeyValue(el: Element): string | undefined {
 export function isCapabilitySubmodel(smElement: Element): boolean {
   const keyValue = getSemanticIdKeyValue(smElement)
   if (!keyValue) return false
-  return keyValue.includes('CapabilityDescription') && keyValue.includes('Submodel')
+  return keyValue === CAPABILITY_SEMANTIC_IDS.Submodel
 }
 
 function detectRole(capabilityEl: Element): CapabilityRole {
@@ -213,11 +214,36 @@ function parseConstraints(relationsEl: Element): ParsedCapabilityConstraint[] {
       }
     }
 
+    // Resolve ConstraintHasProperty → second element for constrained property
+    let constrainedPropertyIdShort: string | undefined
+    const constraintRelations = getLocalElements(ccValue, 'submodelElementCollection')
+      .find(el => getIdShort(el) === 'ConstraintPropertyRelations')
+    if (constraintRelations) {
+      const crValue = getLocalElement(constraintRelations, 'value')
+      if (crValue) {
+        const hasProperty = getLocalElements(crValue, 'relationshipElement')
+          .find(el => getIdShort(el) === 'ConstraintHasProperty')
+        if (hasProperty) {
+          const second = getLocalElement(hasProperty, 'second')
+          if (second) {
+            const keysEl = getLocalElement(second, 'keys')
+            if (keysEl) {
+              const allKeys = getLocalElements(keysEl, 'key')
+              if (allKeys.length > 0) {
+                constrainedPropertyIdShort = getTextContent(allKeys[allKeys.length - 1], 'value')
+              }
+            }
+          }
+        }
+      }
+    }
+
     result.push({
       idShort,
       constraintType,
       ...(constraintValue !== undefined ? { value: constraintValue } : {}),
       ...(conditionalType ? { conditionalType } : {}),
+      ...(constrainedPropertyIdShort ? { constrainedPropertyIdShort } : {}),
     })
   }
 
@@ -288,18 +314,20 @@ export function parseCapabilitySubmodel(sm: Element): ParsedCapabilitySubmodel {
   const submodelElements = getLocalElement(sm, 'submodelElements')
   if (!submodelElements) return { submodelId, capabilities: [] }
 
-  // Find CapabilitySet
-  const capabilitySet = getLocalElements(submodelElements, 'submodelElementCollection')
-    .find(el => getIdShort(el) === 'CapabilitySet')
-  if (!capabilitySet) return { submodelId, capabilities: [] }
-
-  const csValue = getLocalElement(capabilitySet, 'value')
-  if (!csValue) return { submodelId, capabilities: [] }
-
+  // Iterate ALL CapabilitySets (spec says 1..*)
   const capabilities: ParsedCapability[] = []
-  const containers = getLocalElements(csValue, 'submodelElementCollection')
-  for (const container of containers) {
-    capabilities.push(parseCapabilityContainer(container))
+  const allSMCs = getLocalElements(submodelElements, 'submodelElementCollection')
+  for (const smc of allSMCs) {
+    const semId = getSemanticIdKeyValue(smc)
+    if (semId !== CAPABILITY_SEMANTIC_IDS.CapabilitySet) continue
+
+    const csValue = getLocalElement(smc, 'value')
+    if (!csValue) continue
+
+    const containers = getLocalElements(csValue, 'submodelElementCollection')
+    for (const container of containers) {
+      capabilities.push(parseCapabilityContainer(container))
+    }
   }
 
   return { submodelId, capabilities }

@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { ChevronRight, ChevronDown, FileText, CheckCircle, AlertCircle, Download, X, Copy } from 'lucide-react'
 import JSZip from 'jszip'
 import type { ValidationResult, ValidationError } from "@/lib/types" // Import ValidationResult type
@@ -14,7 +14,7 @@ import { toast } from "sonner"
 import KeysEditor from "@/components/keys-editor"
 import { validateAASStructure } from "@/lib/json-validator"
 import { parseCapabilitySubmodel } from "@/lib/parsers/capability-parser"
-import type { ParsedCapabilitySubmodel } from "@/lib/types/capability"
+import { CAPABILITY_SEMANTIC_IDS, type ParsedCapabilitySubmodel } from "@/lib/types/capability"
 import { CapabilityCard } from "@/components/submodels/capability/CapabilityCard"
 
 // ADD: same options as editor
@@ -140,6 +140,7 @@ interface AASXVisualizerProps {
 export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: AASXVisualizerProps) {
   const [aasxData, setAasxData] = useState<any>(null)
   const [selectedFile, setSelectedFile] = useState<ValidationResult | null>(null) // Use ValidationResult type
+  const [selectedShellIndex, setSelectedShellIndex] = useState<number | null>(0)
   const [selectedSubmodel, setSelectedSubmodel] = useState<any>(null)
   const [selectedElement, setSelectedElement] = useState<any>(null)
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
@@ -154,17 +155,36 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
   const [liveErrors, setLiveErrors] = useState<(string | { message: string })[]>([])
   // Capability submodel parsed data (computed when a capability submodel is selected)
   const [capabilityData, setCapabilityData] = useState<ParsedCapabilitySubmodel | null>(null)
+  const capabilityCacheRef = useRef<{ xml: string; smId: string; data: ParsedCapabilitySubmodel } | null>(null)
 
   // Detect and parse capability submodels from the original XML
-  const isCapabilitySubmodelSelected = !!(
-    selectedSubmodel?.semanticId &&
-    selectedSubmodel.semanticId.includes('CapabilityDescription') &&
-    selectedSubmodel.semanticId.includes('Submodel')
-  )
+  const resolveSemanticId = (semId: any): string | undefined => {
+    if (!semId) return undefined
+    if (typeof semId === 'string') return semId
+    // Object with keys array (parsed XML): { keys: [{ value }] } or { keys: { key: { value } } }
+    if (semId.keys) {
+      if (Array.isArray(semId.keys)) {
+        return semId.keys[0]?.value
+      }
+      // fast-xml-parser style: keys.key may be object or array
+      const k = semId.keys.key
+      if (Array.isArray(k)) return k[0]?.value
+      if (k?.value) return k.value
+    }
+    if (semId.value) return String(semId.value)
+    return undefined
+  }
+  const isCapabilitySubmodelSelected = resolveSemanticId(selectedSubmodel?.semanticId) === CAPABILITY_SEMANTIC_IDS.Submodel
 
   useEffect(() => {
     if (!isCapabilitySubmodelSelected || !selectedFile?.originalXml || !selectedSubmodel?.id) {
       setCapabilityData(null)
+      return
+    }
+    // Return cached result if XML and submodel ID haven't changed
+    const cached = capabilityCacheRef.current
+    if (cached && cached.xml === selectedFile.originalXml && cached.smId === selectedSubmodel.id) {
+      setCapabilityData(cached.data)
       return
     }
     try {
@@ -175,7 +195,9 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
         const sm = submodels[i]
         const idEl = sm.querySelector('id')
         if (idEl?.textContent?.trim() === selectedSubmodel.id) {
-          setCapabilityData(parseCapabilitySubmodel(sm))
+          const parsed = parseCapabilitySubmodel(sm)
+          capabilityCacheRef.current = { xml: selectedFile.originalXml, smId: selectedSubmodel.id, data: parsed }
+          setCapabilityData(parsed)
           return
         }
       }
@@ -196,10 +218,11 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
     toast.success(`${label} copied`)
   }
 
-  // Update helper for AAS fields (writes into aasxData.assetAdministrationShells[0])
+  // Update helper for AAS fields (writes into selected shell)
   const setAASFieldValue = (key: 'idShort' | 'id' | 'assetKind' | 'globalAssetId', value: string) => {
-    if (!aasxData || !Array.isArray(aasxData.assetAdministrationShells) || !aasxData.assetAdministrationShells[0]) return
-    const shell = aasxData.assetAdministrationShells[0]
+    const idx = selectedShellIndex ?? 0
+    if (!aasxData || !Array.isArray(aasxData.assetAdministrationShells) || !aasxData.assetAdministrationShells[idx]) return
+    const shell = aasxData.assetAdministrationShells[idx]
     if (key === 'globalAssetId') {
       shell.assetInformation = shell.assetInformation || {}
       shell.assetInformation.globalAssetId = value
@@ -224,7 +247,18 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
     // Ensure content is parsed AASXData structure
     if (selectedFile.aasData && selectedFile.aasData.submodels) { // Use aasData from ValidationResult
       setAasxData(selectedFile.aasData)
-      setSelectedSubmodel(selectedFile.aasData.submodels[0])
+      setSelectedShellIndex(0)
+      // Select first submodel that belongs to the first shell (or first overall)
+      const shells = selectedFile.aasData.assetAdministrationShells
+      const firstShell = shells?.[0]
+      const refs = firstShell?.submodelRefs
+      const allSubmodels = selectedFile.aasData.submodels
+      if (refs && refs.length > 0) {
+        const first = allSubmodels.find((sm: any) => refs.includes(sm.id))
+        setSelectedSubmodel(first || allSubmodels[0])
+      } else {
+        setSelectedSubmodel(allSubmodels[0])
+      }
     } else {
       // Fallback if content is not in expected AASXData format
       setAasxData({ idShort: selectedFile.file, submodels: [] }) // Use file.name for idShort
@@ -1519,8 +1553,17 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
     )
   }
 
-  // Get the first AAS from the selected file's AAS data
-  const currentAAS = (aasxData?.assetAdministrationShells?.[0]) || selectedFile?.aasData?.assetAdministrationShells?.[0];
+  // Get the selected AAS shell
+  const shells = aasxData?.assetAdministrationShells || selectedFile?.aasData?.assetAdministrationShells || []
+  const currentAAS = selectedShellIndex !== null ? shells[selectedShellIndex] : shells[0]
+  const hasMultipleShells = shells.length > 1
+
+  // Filter submodels to those referenced by the current shell (show all if no refs)
+  const currentShellRefs: string[] | undefined = currentAAS?.submodelRefs
+  const visibleSubmodels = (aasxData?.submodels || []).filter((sm: any) => {
+    if (!currentShellRefs || currentShellRefs.length === 0) return true
+    return currentShellRefs.includes(sm.id)
+  })
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -1730,42 +1773,109 @@ export function AASXVisualizer({ uploadedFiles, newFileIndex, onFileSelected }: 
 
       {/* Three-panel layout */}
       <div className="aasx-overlay-container">
-        {/* Left Panel - Submodels (AAS info removed to avoid duplication) */}
+        {/* Left Panel - AAS shells with nested submodels */}
         <div className="aasx-left-panel" style={{ backgroundColor: "rgba(97, 202, 243, 0.1)" }}>
-          
-           {aasxData?.submodels?.length > 0 ? (
-             aasxData.submodels.map((submodel: any, idx: number) => (
-               <div
-                 key={submodel.id || idx}
-                 className={`aasx-submodel-card ${selectedSubmodel === submodel ? "" : "aasx-submodel-card-default"}`}
-                 style={{
-                   border: selectedSubmodel === submodel ? "1px solid #61caf3" : undefined,
-                 }}
-                 onClick={() => {
-                   setSelectedSubmodel(submodel)
-                   setSelectedElement(null)
-                   setExpandedNodes(new Set())
-                 }}
-               >
-                 <div
-                   className="w-9 h-9 rounded-full flex items-center justify-center text-white"
-                   style={{ backgroundColor: selectedSubmodel === submodel ? "#61caf3" : "#adadae" }}
-                 >
-                   <FileText className="w-5 h-5" />
-                 </div>
-                 <span
-                   className={`text-xs text-center truncate w-full ${
-                     selectedSubmodel === submodel ? "text-[#61caf3] font-medium" : "text-[#adadae]"
-                   }`}
-                   title={submodel.idShort || `Submodel ${idx + 1}`}
-                 >
-                   {submodel.idShort || `Submodel ${idx + 1}`}
-                 </span>
-               </div>
-             ))
-           ) : (
-             <div className="aasx-no-selection-message">No submodels found</div>
-           )}
+          {shells.length > 0 ? (
+            <div className="flex flex-col gap-1 w-full p-1">
+              {shells.map((shell: any, shellIdx: number) => {
+                const isSelected = selectedShellIndex === shellIdx
+                const refs: string[] | undefined = shell.submodelRefs
+                const shellSubmodels = (aasxData?.submodels || []).filter((sm: any) => {
+                  if (!refs || refs.length === 0) return shells.length === 1
+                  return refs.includes(sm.id)
+                })
+                return (
+                  <div key={shell.id || shellIdx} className="w-full">
+                    {/* AAS shell header (clickable to select + expand/collapse) */}
+                    <button
+                      onClick={() => {
+                        if (isSelected) {
+                          // Toggle collapse
+                          setSelectedShellIndex(null)
+                        } else {
+                          setSelectedShellIndex(shellIdx)
+                          setSelectedElement(null)
+                          setExpandedNodes(new Set())
+                          // Auto-select first submodel of this shell
+                          if (shellSubmodels.length > 0) {
+                            setSelectedSubmodel(shellSubmodels[0])
+                          }
+                        }
+                      }}
+                      className={`w-full flex items-center gap-2 px-2 py-2 rounded-lg transition-colors text-left ${
+                        isSelected
+                          ? 'bg-[#61caf3]/15 border border-[#61caf3]/40'
+                          : 'hover:bg-gray-100 dark:hover:bg-gray-800/50 border border-transparent'
+                      }`}
+                      title={shell.id || `AAS ${shellIdx + 1}`}
+                    >
+                      {/* Thumbnail */}
+                      <div className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 ${
+                        isSelected ? 'bg-[#61caf3] text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
+                      }`}>
+                        {selectedFile?.thumbnail ? (
+                          <img src={selectedFile.thumbnail} alt="" className="w-full h-full rounded-md object-contain" />
+                        ) : (
+                          <FileText className="w-4 h-4" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className={`text-xs font-medium truncate ${
+                          isSelected ? 'text-[#61caf3]' : 'text-gray-700 dark:text-gray-300'
+                        }`}>
+                          {shell.idShort || `AAS ${shellIdx + 1}`}
+                        </div>
+                        <div className="text-[10px] text-gray-400 dark:text-gray-500 truncate">
+                          {shellSubmodels.length} submodel{shellSubmodels.length !== 1 ? 's' : ''}
+                        </div>
+                      </div>
+                      <ChevronRight className={`w-3.5 h-3.5 shrink-0 transition-transform ${
+                        isSelected ? 'rotate-90 text-[#61caf3]' : 'text-gray-400'
+                      }`} />
+                    </button>
+                    {/* Nested submodels (shown when AAS is selected) */}
+                    {isSelected && (
+                      <div className="ml-3 mt-1 flex flex-col gap-1 border-l-2 border-[#61caf3]/20 pl-2">
+                        {shellSubmodels.length > 0 ? (
+                          shellSubmodels.map((submodel: any, smIdx: number) => (
+                            <button
+                              key={submodel.id || smIdx}
+                              onClick={() => {
+                                setSelectedSubmodel(submodel)
+                                setSelectedElement(null)
+                                setExpandedNodes(new Set())
+                              }}
+                              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md transition-colors text-left ${
+                                selectedSubmodel === submodel
+                                  ? 'bg-[#61caf3]/10 text-[#61caf3]'
+                                  : 'hover:bg-gray-100 dark:hover:bg-gray-800/50 text-gray-500 dark:text-gray-400'
+                              }`}
+                              title={submodel.idShort || `Submodel ${smIdx + 1}`}
+                            >
+                              <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
+                                selectedSubmodel === submodel
+                                  ? 'bg-[#61caf3] text-white'
+                                  : 'bg-gray-200 dark:bg-gray-700'
+                              }`}>
+                                <FileText className="w-3 h-3" />
+                              </div>
+                              <span className="text-xs truncate">
+                                {submodel.idShort || `Submodel ${smIdx + 1}`}
+                              </span>
+                            </button>
+                          ))
+                        ) : (
+                          <span className="text-[10px] text-gray-400 px-2 py-1">No submodels</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="aasx-no-selection-message">No AAS found</div>
+          )}
         </div>
 
         {/* Middle Panel - Tree View and Validation Errors */}
